@@ -1,0 +1,20 @@
+# Ignore data folder
+data/
+
+# Leave initially, but remove before submission
+#myinfo/
+
+# Python build/cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# VS Code settings
+.vscode/
