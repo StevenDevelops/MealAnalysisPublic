@@ -19,3 +19,6 @@ venv/
 # VS Code settings
 .vscode/
 .gitignore
+
+# MacOS specific files
+.DS_Store
