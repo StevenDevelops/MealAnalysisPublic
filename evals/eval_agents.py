@@ -208,14 +208,14 @@ def run_agent(job: EvalJob) -> Dict[str, Any]:
     - JSON parsing
     """
     # Minimal dummy outputs by agent type
-    if job.agent == "guardrailCheck":
+    if job.agent == "inputGuardrail":
         return {
             "is_food": True,
             "no_pii": True,
             "no_humans": True,
             "no_captcha": True,
         }
-    if job.agent == "safetyChecks":
+    if job.agent == "outputGuardrail":
         return {
             "no_judgmental_language": True,
             "no_medical_advice": True,
