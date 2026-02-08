@@ -189,13 +189,15 @@ def dry_run_print_jobs(jobs: List[EvalJob], n: int = 10) -> None:
 # ---- CSV schema ----
 CSV_COLUMNS = [
     # identity
-    "id", "agent", "io", "model",
+    "id", 
+    "title",
+    "agent", "io", "model",
     # paths (useful for debugging)
     "img_path", "json_path",
     # timing / usage (filled later when we call OpenAI)
     "latency_ms", "input_tokens", "output_tokens",
     # common eval fields (filled later by scoring)
-    "parse_ok", "error",
+    "parse_ok", "error", "raw_output_snippet",
 
     # inputGuardrail / safety booleans
     "is_food", "no_pii", "no_humans", "no_captcha",
@@ -225,7 +227,7 @@ def run_agent(job: EvalJob, client: OpenAI) -> Tuple[Dict[str, Any], float, int,
     Lowest tempearture to encourage more deterministic, predicatable outputs
 
     Returns:
-    (agent_output, latency_ms, input_tokens, output_tokens, parse_ok, error_message)
+    (agent_output, latency_ms, input_tokens, output_tokens, parse_ok, error_message, raw_output)
     """
     t0 = time.time()
 
@@ -311,15 +313,16 @@ def run_agent(job: EvalJob, client: OpenAI) -> Tuple[Dict[str, Any], float, int,
         # ---- Parse JSON ----
         try:
             agent_output = parse_json_loose(raw)
-            return agent_output, latency_ms, input_tokens, output_tokens, True, ""
+            return agent_output, latency_ms, input_tokens, output_tokens, True, "", raw
+        
         except Exception as je:
             # JSON parse failure — return raw text in error
-            return {}, latency_ms, input_tokens, output_tokens, False, f"json_parse_error: {je}; raw={raw[:300]}"
+            return {}, latency_ms, input_tokens, output_tokens, False, f"json_parse_error: {je}", raw
 
     except Exception as e:
         t1 = time.time()
         latency_ms = (t1 - t0) * 1000.0
-        return {}, latency_ms, 0, 0, False, f"openai_error: {repr(e)}"
+        return {}, latency_ms, 0, 0, False, f"openai_error: {repr(e)}", ""
 
 # json sanitizer to strip code fences and other common wrappers
 # that might cause json parsing to fail (clean json output from model)
@@ -366,10 +369,12 @@ def make_csv_row(
     output_tokens: int,
     parse_ok: bool,
     error: str,
+    raw_output: str,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {k: "" for k in CSV_COLUMNS}
 
     row["id"] = job.sample.id
+    row["title"] = job.sample.gt.get("title", "")
     row["agent"] = job.agent
     row["io"] = job.io
     row["model"] = job.model
@@ -382,6 +387,7 @@ def make_csv_row(
 
     row["parse_ok"] = 1 if parse_ok else 0
     row["error"] = error
+    row["raw_output_snippet"] = raw_output[:800] # store a truncated raw output for debugging
 
     # inputGuardrail fields
     for k in ["is_food", "no_pii", "no_humans", "no_captcha"]:
@@ -495,8 +501,12 @@ def main():
 
     rows: List[Dict[str, Any]] = []
     for job in selected_jobs:
-        agent_output, latency_ms, in_tok, out_tok, parse_ok, err = run_agent(job, client)
-        row = make_csv_row(job, agent_output, root, latency_ms, in_tok, out_tok, parse_ok, err)
+        agent_output, latency_ms, in_tok, out_tok, parse_ok, err, raw = run_agent(job, client)
+        row = make_csv_row(
+            job, agent_output, root,
+            latency_ms, in_tok, out_tok,
+            parse_ok, err, raw
+        )
         rows.append(row)
 
         print(f"Ran job: agent={job.agent} model={job.model} id={job.sample.id} parse_ok={parse_ok}")
