@@ -1,10 +1,12 @@
 import os
 import json
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Literal
 
 ALLOWED_IMAGE_EXT = ".jpeg"
 
+# Each Sample is a single test input -> expected output, both local files
+# The Id is derived from the filename, used to match local image <-> json files
 @dataclass(frozen=True) # @dataclass for boilerplate, frozen=True for immutability
 class Sample:
     id: str
@@ -13,6 +15,27 @@ class Sample:
     gt: Dict  # parsed ground truth JSON
 
 
+AgentName = Literal["inputGuardrail", "mealAnalysis", "outputGuardrail"]
+AgentIO = Literal["vision", "text"]
+
+# Each AgentConfig represents the configuration for one agent
+# including its name, IO type, and list of models to evaluate
+@dataclass(frozen=True)
+class AgentConfig:
+    name: AgentName
+    io: AgentIO
+    models: List[str]
+
+# Each EvalJob represents a single evaluation run of one agent 
+# (with specific model) on one sample
+@dataclass(frozen=True)
+class EvalJob:
+    agent: AgentName
+    io: AgentIO
+    model: str
+    sample: Sample
+
+"""METHODS FOR LOADING DATASET FROM LOCAL FILES"""
 def _require_dir_nonempty(path: str, name: str) -> None:
     if not os.path.isdir(path):
         raise FileNotFoundError(f"{name} directory not found: {path}")
@@ -127,6 +150,30 @@ def load_dataset(root: str) -> List[Sample]:
     return samples
 
 
+"""METHODS FOR LOADING AGENT CONFIGURATIONS, AND BUILDING EVALUTION JOBS"""
+def build_jobs(samples: List[Sample], agents: List[AgentConfig]) -> List[EvalJob]:
+    """
+    Builds the Cartesian product of:
+    (agent config) × (models for that agent) × (samples)
+    No API calls here — just prepares a list of work items.
+    """
+    jobs: List[EvalJob] = []
+    for agent_cfg in agents:
+        for model in agent_cfg.models:
+            for s in samples:
+                jobs.append(EvalJob(
+                    agent=agent_cfg.name,
+                    io=agent_cfg.io,
+                    model=model,
+                    sample=s,
+                ))
+    return jobs
+
+def dry_run_print_jobs(jobs: List[EvalJob], n: int = 10) -> None:
+    print(f"Planned {len(jobs)} eval jobs total.")
+    for j in jobs[:n]:
+        print(f"- agent={j.agent} io={j.io} model={j.model} sample_id={j.sample.id}")
+
 def main():
     # file lives in evals/eval_agents.py -> project root is one level up from evals/
     root = os.path.dirname(os.path.dirname(__file__))
@@ -138,8 +185,19 @@ def main():
         print(f"- {s.id}")
         print(f"  gt_keys: {list(s.gt.keys())}")
         print('________________________________________________')
-        
+    
+    # Set up agent configurations
+    agents: List[AgentConfig] = [
+        AgentConfig(name="inputGuardrail", io="vision", models=["gpt-4.1-mini", "gpt-4.1"]),
+        AgentConfig(name="mealAnalysis",   io="vision", models=["gpt-4.1-mini", "gpt-4.1"]),
+        AgentConfig(name="outputGuardrail",   io="text",   models=["gpt-4.1-nano", "gpt-4.1-mini"]),
+    ]
 
+    jobs = build_jobs(samples, agents)
+
+    # Dry run: just print a few jobs so we know the harness is correct
+    dry_run_print_jobs(jobs, n=100)
+        
 
 if __name__ == "__main__":
     main()
