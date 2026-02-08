@@ -2,6 +2,7 @@ import csv
 import time
 import os
 import json
+import argparse
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple, Literal, Any
 
@@ -10,12 +11,18 @@ import base64
 import random
 from openai import OpenAI
 from dotenv import load_dotenv
+import yaml
 
 # Imports to help parse and sanitize json outputs from the model
 import re
-import json
 
 ALLOWED_IMAGE_EXT = ".jpeg"
+DEFAULT_CONFIG_PATH = os.path.join("evals", "agent_models.yaml")
+AGENT_TO_IO: Dict[str, str] = {
+    "inputGuardrail": "vision",
+    "mealAnalysis": "vision",
+    "outputGuardrail": "text",
+}
 
 """CLASS DEFINITIONS"""
 # Each Sample is a single test input -> expected output, both local files
@@ -186,6 +193,76 @@ def dry_run_print_jobs(jobs: List[EvalJob], n: int = 10) -> None:
     for j in jobs[:n]:
         print(f"- agent={j.agent} io={j.io} model={j.model} sample_id={j.sample.id}")
 
+
+def load_agent_configs(config_path: str) -> List[AgentConfig]:
+    """Load agent/model config from YAML."""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Agent config file not found: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    if isinstance(raw, dict):
+        items = raw.get("agents")
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = None
+
+    if not isinstance(items, list) or len(items) == 0:
+        raise RuntimeError(
+            "Invalid agent config YAML. Expected either a top-level list or "
+            "a dict with key 'agents' as a non-empty list."
+        )
+
+    agents: List[AgentConfig] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Invalid agent config entry at index {idx}: expected object")
+
+        name_raw = item.get("name")
+        io_raw = item.get("io")
+        models_raw = item.get("models")
+
+        if not isinstance(name_raw, str) or name_raw not in AGENT_TO_IO:
+            raise RuntimeError(
+                f"Invalid agent name at index {idx}: {name_raw!r}. "
+                f"Allowed: {sorted(AGENT_TO_IO.keys())}"
+            )
+        name: AgentName = name_raw  # type: ignore[assignment]
+
+        expected_io = AGENT_TO_IO[name]
+        if io_raw is None:
+            io: AgentIO = expected_io
+        elif isinstance(io_raw, str) and io_raw in {"vision", "text"}:
+            if io_raw != expected_io:
+                raise RuntimeError(
+                    f"Invalid io for agent {name!r} at index {idx}: {io_raw!r}. "
+                    f"Expected: {expected_io!r}"
+                )
+            io = io_raw  # type: ignore[assignment]
+        else:
+            raise RuntimeError(
+                f"Invalid io at index {idx}: {io_raw!r}. Allowed: 'vision' or 'text'"
+            )
+
+        if not isinstance(models_raw, list) or len(models_raw) == 0:
+            raise RuntimeError(f"Invalid models list for agent {name!r} at index {idx}")
+
+        models: List[str] = []
+        for m in models_raw:
+            if not isinstance(m, str) or not m.strip():
+                raise RuntimeError(
+                    f"Invalid model entry for agent {name!r} at index {idx}: {m!r}"
+                )
+            models.append(m.strip())
+
+        # Preserve order while removing duplicates.
+        deduped_models = list(dict.fromkeys(models))
+        agents.append(AgentConfig(name=name, io=io, models=deduped_models))
+
+    return agents
+
 # ---- CSV schema ----
 CSV_COLUMNS = [
     # identity
@@ -213,14 +290,24 @@ CSV_COLUMNS = [
     "no_risky_ingredient_substitutions",
     "no_treatment_recommendation",
     "no_medical_diagnosis",
-
-    # scores
-    "guardrail_pass", "safety_pass",
-    "macros_score_0_100", "ingredients_accuracy_0_100", "text_quality_0_100",
-    "meal_composite_0_100",
 ]
 
 """METHODS FOR RUNNING AGENTS AND OUTPUT RESULTS TO CSV"""
+def _supports_temperature(model: str) -> bool:
+    """GPT-5 family models reject temperature in many configurations."""
+    return not (model or "").strip().lower().startswith("gpt-5")
+
+
+def _create_response(client: OpenAI, model: str, input_payload: Any):
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "input": input_payload,
+    }
+    if _supports_temperature(model):
+        kwargs["temperature"] = 0
+    return client.responses.create(**kwargs)
+
+
 def run_agent(job: EvalJob, client: OpenAI) -> Tuple[Dict[str, Any], float, int, int, bool, str]:
     """
     Executes one agent call using OpenAI Responses API.
@@ -262,10 +349,10 @@ def run_agent(job: EvalJob, client: OpenAI) -> Tuple[Dict[str, Any], float, int,
             else:
                 raise ValueError(f"Unexpected vision agent: {job.agent}")
 
-            resp = client.responses.create(
+            resp = _create_response(
+                client=client,
                 model=job.model,
-                temperature=0,
-                input=[{"role": "user", "content": [text_part, image_part]}],
+                input_payload=[{"role": "user", "content": [text_part, image_part]}],
             )
         
         else:
@@ -295,10 +382,10 @@ def run_agent(job: EvalJob, client: OpenAI) -> Tuple[Dict[str, Any], float, int,
                 f"TEXT:\n{text_to_check}"
             )
 
-            resp = client.responses.create(
+            resp = _create_response(
+                client=client,
                 model=job.model,
-                temperature=0,
-                input=prompt,
+                input_payload=prompt,
             )
 
         t1 = time.time()
@@ -464,8 +551,19 @@ def build_openai_client(root: str) -> OpenAI:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--agents-config",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"Path to YAML agent config (default: {DEFAULT_CONFIG_PATH})",
+    )
+    args = parser.parse_args()
+
     # file lives in evals/eval_agents.py -> project root is one level up from evals/
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = args.agents_config
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(root, config_path)
 
     samples = load_dataset(root)
 
@@ -475,12 +573,10 @@ def main():
         print(f"  gt_keys: {list(s.gt.keys())}")
         print('________________________________________________')
     
-    # Set up agent configurations
-    agents: List[AgentConfig] = [
-        AgentConfig(name="inputGuardrail", io="vision", models=["gpt-4.1-mini", "gpt-4.1"]),
-        AgentConfig(name="mealAnalysis",   io="vision", models=["gpt-4.1-mini", "gpt-4.1"]),
-        AgentConfig(name="outputGuardrail",   io="text",   models=["gpt-4.1-nano", "gpt-4.1-mini"]),
-    ]
+    agents = load_agent_configs(config_path)
+    print(f"Loaded {len(agents)} agent config(s) from {config_path}")
+    for a in agents:
+        print(f"- {a.name} ({a.io}): {a.models}")
 
     jobs = build_jobs(samples, agents)
 
@@ -496,7 +592,7 @@ def main():
 
     # Pick 10 random jobs (reproducible seed)
     random.seed(12)
-    k = min(15, len(jobs))
+    k = min(20, len(jobs))
     selected_jobs = random.sample(jobs, k=k)
 
     rows: List[Dict[str, Any]] = []
@@ -513,7 +609,6 @@ def main():
 
     append_csv_rows(out_csv, rows)
     print(f"Wrote {len(rows)} REAL rows to {out_csv}")
-        
 
 if __name__ == "__main__":
     main()
