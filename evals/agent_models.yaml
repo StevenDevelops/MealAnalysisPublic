@@ -1,0 +1,21 @@
+# For each agent, we can specify 
+# which model(s) we want to be evaluated
+agents:
+  - name: inputGuardrail
+    io: vision
+    models:
+      - gpt-4.1-mini
+      - gpt-4.1
+
+  - name: mealAnalysis
+    io: vision
+    models:
+      - gpt-4.1-mini
+      - gpt-4.1
+      #- gpt-5-mini # can't use this model, requires verification
+
+  - name: outputGuardrail
+    io: text
+    models:
+      - gpt-4.1-nano
+      - gpt-4.1-mini
