@@ -1,7 +1,9 @@
+import csv
+import time
 import os
 import json
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple, Literal
+from typing import List, Optional, Dict, Tuple, Literal, Any
 
 ALLOWED_IMAGE_EXT = ".jpeg"
 
@@ -13,7 +15,6 @@ class Sample:
     img_path: str
     json_path: str
     gt: Dict  # parsed ground truth JSON
-
 
 AgentName = Literal["inputGuardrail", "mealAnalysis", "outputGuardrail"]
 AgentIO = Literal["vision", "text"]
@@ -174,9 +175,140 @@ def dry_run_print_jobs(jobs: List[EvalJob], n: int = 10) -> None:
     for j in jobs[:n]:
         print(f"- agent={j.agent} io={j.io} model={j.model} sample_id={j.sample.id}")
 
+# ---- CSV schema ----
+CSV_COLUMNS = [
+    # identity
+    "id", "agent", "io", "model",
+    # paths (useful for debugging)
+    "img_path", "json_path",
+    # timing / usage (filled later when we call OpenAI)
+    "latency_ms", "input_tokens", "output_tokens",
+    # common eval fields (filled later by scoring)
+    "parse_ok", "error",
+    # guardrail/safety booleans (optional per agent)
+    "is_food", "no_pii", "no_humans", "no_captcha",
+    # mealAnalysis fields (optional per agent)
+    "recommendation", "meal_title", "meal_description", "guidance_message",
+    "calories", "carbohydrates", "fats", "proteins",
+    # scores (filled later)
+    "guardrail_pass", "safety_pass",
+    "macros_score_0_100", "ingredients_accuracy_0_100", "text_quality_0_100",
+    "meal_composite_0_100",
+]
+
+"""METHODS FOR RUNNING AGENTS AND OUTPUT RESULTS TO CSV"""
+def run_agent(job: EvalJob) -> Dict[str, Any]:
+    """
+    Stub for now: no OpenAI calls.
+    Returns a dict shaped like an "agent output" so we can test plumbing.
+
+    Later, replace this body with:
+    - prompt+schema building
+    - OpenAI Responses API call
+    - JSON parsing
+    """
+    # Minimal dummy outputs by agent type
+    if job.agent == "guardrailCheck":
+        return {
+            "is_food": True,
+            "no_pii": True,
+            "no_humans": True,
+            "no_captcha": True,
+        }
+    if job.agent == "safetyChecks":
+        return {
+            "no_judgmental_language": True,
+            "no_medical_advice": True,
+            "no_diagnosis": True,
+            "no_treatment_recommendations": True,
+        }
+    # mealAnalysis dummy
+    return {
+        "is_food": True,
+        "recommendation": "green",
+        "meal_title": "Dummy Meal Title",
+        "meal_description": "Dummy meal description.",
+        "guidance_message": "Dummy guidance message.",
+        "macros": {
+            "calories": 500,
+            "carbohydrates": 50,
+            "fats": 20,
+            "proteins": 25,
+        },
+        "ingredients": [
+            {"name": "dummy ingredient", "impact": "green"}
+        ],
+    }
+
+def _project_relpath(path: str, root: str) -> str:
+    """
+    Return project-relative path when possible.
+    Falls back to original path if relative conversion is not valid.
+    """
+    try:
+        rel = os.path.relpath(path, start=root)
+        if rel.startswith(".."):
+            return path
+        return rel
+    except Exception:
+        return path
+
+
+def make_csv_row(job: EvalJob, agent_output: Dict[str, Any], root: str) -> Dict[str, Any]:
+    """
+    Convert (job + agent_output) into a single flat CSV row.
+    For now: no scoring, no tokens, no real latency. Just plumbing.
+    """
+    row: Dict[str, Any] = {k: "" for k in CSV_COLUMNS}
+
+    row["id"] = job.sample.id
+    row["agent"] = job.agent
+    row["io"] = job.io
+    row["model"] = job.model
+    row["img_path"] = _project_relpath(job.sample.img_path, root)
+    row["json_path"] = _project_relpath(job.sample.json_path, root)
+
+    # pretend we did work
+    row["parse_ok"] = 1
+    row["error"] = ""
+
+    # Fill guardrail outputs if present
+    for k in ["is_food", "no_pii", "no_humans", "no_captcha"]:
+        if k in agent_output:
+            row[k] = agent_output[k]
+
+    # Fill mealAnalysis outputs if present
+    if "recommendation" in agent_output:
+        row["recommendation"] = agent_output.get("recommendation", "")
+        row["meal_title"] = agent_output.get("meal_title", "")
+        row["meal_description"] = agent_output.get("meal_description", "")
+        row["guidance_message"] = agent_output.get("guidance_message", "")
+
+        macros = agent_output.get("macros", {}) or {}
+        row["calories"] = macros.get("calories", "")
+        row["carbohydrates"] = macros.get("carbohydrates", "")
+        row["fats"] = macros.get("fats", "")
+        row["proteins"] = macros.get("proteins", "")
+
+    return row
+
+# CSV writing utilities: write header once, then append rows as we go
+# Will ovewrrite existing output CSV file if it exists
+def write_csv_header(path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+
+def append_csv_rows(path: str, rows: List[Dict[str, Any]]) -> None:
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        for r in rows:
+            writer.writerow(r)
+
 def main():
     # file lives in evals/eval_agents.py -> project root is one level up from evals/
-    root = os.path.dirname(os.path.dirname(__file__))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     samples = load_dataset(root)
 
@@ -196,7 +328,21 @@ def main():
     jobs = build_jobs(samples, agents)
 
     # Dry run: just print a few jobs so we know the harness is correct
-    dry_run_print_jobs(jobs, n=100)
+    dry_run_print_jobs(jobs, n=10)
+
+    # Create CSV file with headers (will overwrite if already exists)
+    out_csv = os.path.join(root, "outputs", "results.csv")
+    write_csv_header(out_csv)
+
+    # next safe step: run just a handful of jobs with dummy outputs
+    rows: List[Dict[str, Any]] = []
+    for job in jobs[:10]:
+        agent_output = run_agent(job)         # stubbed (no OpenAI)
+        row = make_csv_row(job, agent_output, root) # flatten for CSV
+        rows.append(row)
+
+    append_csv_rows(out_csv, rows)
+    print(f"Wrote {len(rows)} dummy rows to {out_csv}")
         
 
 if __name__ == "__main__":
