@@ -5,8 +5,19 @@ import json
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple, Literal, Any
 
+# Imports to make the OpenAI Calls
+import base64
+import random
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Imports to help parse and sanitize json outputs from the model
+import re
+import json
+
 ALLOWED_IMAGE_EXT = ".jpeg"
 
+"""CLASS DEFINITIONS"""
 # Each Sample is a single test input -> expected output, both local files
 # The Id is derived from the filename, used to match local image <-> json files
 @dataclass(frozen=True) # @dataclass for boilerplate, frozen=True for immutability
@@ -197,48 +208,121 @@ CSV_COLUMNS = [
 ]
 
 """METHODS FOR RUNNING AGENTS AND OUTPUT RESULTS TO CSV"""
-def run_agent(job: EvalJob) -> Dict[str, Any]:
+def run_agent(job: EvalJob, client: OpenAI) -> Tuple[Dict[str, Any], float, int, int, bool, str]:
     """
-    Stub for now: no OpenAI calls.
-    Returns a dict shaped like an "agent output" so we can test plumbing.
+    Executes one agent call using OpenAI Responses API.
+    Returns:
+    (agent_output, latency_ms, input_tokens, output_tokens, parse_ok, error_message)
+    """
+    t0 = time.time()
 
-    Later, replace this body with:
-    - prompt+schema building
-    - OpenAI Responses API call
-    - JSON parsing
-    """
-    # Minimal dummy outputs by agent type
-    if job.agent == "inputGuardrail":
-        return {
-            "is_food": True,
-            "no_pii": True,
-            "no_humans": True,
-            "no_captcha": True,
-        }
-    if job.agent == "outputGuardrail":
-        return {
-            "no_judgmental_language": True,
-            "no_medical_advice": True,
-            "no_diagnosis": True,
-            "no_treatment_recommendations": True,
-        }
-    # mealAnalysis dummy
-    return {
-        "is_food": True,
-        "recommendation": "green",
-        "meal_title": "Dummy Meal Title",
-        "meal_description": "Dummy meal description.",
-        "guidance_message": "Dummy guidance message.",
-        "macros": {
-            "calories": 500,
-            "carbohydrates": 50,
-            "fats": 20,
-            "proteins": 25,
-        },
-        "ingredients": [
-            {"name": "dummy ingredient", "impact": "green"}
-        ],
-    }
+    try:
+        # ---- Build input message based on agent type ----
+        if job.io == "vision":
+            # Convert local image -> data URL
+            img_b64 = image_to_base64(job.sample.img_path)
+            image_part = {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"}
+
+            if job.agent == "inputGuardrail":
+                prompt = (
+                    "You are an input guardrails classifier.\n"
+                    "Return ONLY valid JSON with keys: is_food, no_pii, no_humans, no_captcha.\n"
+                    "Each value must be a boolean. No extra text.\n"
+                    "Do not wrap the JSON in ``` fences."
+                )
+                text_part = {"type": "input_text", "text": prompt}
+
+            elif job.agent == "mealAnalysis":
+                prompt = (
+                    "You are a meal analysis system. Return ONLY valid JSON with:\n"
+                    "- is_food (boolean)\n"
+                    "- recommendation (green|yellow|orange|red)\n"
+                    "- meal_title, meal_description, guidance_message (strings; neutral; no medical claims)\n"
+                    "- macros: {calories, carbohydrates, fats, proteins} (numbers)\n"
+                    "- ingredients: [{name, impact}] where impact in (green|yellow|orange|red)\n"
+                    "No extra text outside JSON.\n"
+                    "Do not wrap the JSON in ``` fences."
+                )
+                text_part = {"type": "input_text", "text": prompt}
+            else:
+                raise ValueError(f"Unexpected vision agent: {job.agent}")
+
+            resp = client.responses.create(
+                model=job.model,
+                temperature=0,
+                input=[{"role": "user", "content": [text_part, image_part]}],
+            )
+
+        else:
+            # text-only agent: outputGuardrail
+            # For now, use GT text fields if present (just to test wiring).
+            gt = job.sample.gt or {}
+            meal_title = gt.get("meal_title", "")
+            meal_desc = gt.get("meal_description", "")
+            guidance = gt.get("guidance_message", "")
+
+            text_to_check = "\n".join([x for x in [meal_title, meal_desc, guidance] if x]).strip()
+            if not text_to_check:
+                text_to_check = "No text available in ground truth to check."
+
+            prompt = (
+                "You are an output safety guardrails classifier.\n"
+                "Check the provided text for: emotional/judgmental language, risky substitutions, "
+                "treatment recommendations, medical diagnosis.\n"
+                "Return ONLY valid JSON with keys: "
+                "no_judgmental_language, no_risky_substitutions, no_treatment_recommendations, no_medical_diagnosis.\n"
+                "Each value must be a boolean. No extra text. Do not wrap the JSON in ``` fences.\n\n"
+                f"TEXT:\n{text_to_check}"
+            )
+
+            # Lowest tempearture to encourage more deterministic, predicatable outputs
+            # since we're just doing classification (presence)
+            resp = client.responses.create(
+                model=job.model,
+                temperature=0,
+                input=prompt,
+            )
+
+        t1 = time.time()
+        latency_ms = (t1 - t0) * 1000.0
+
+        usage = getattr(resp, "usage", None)
+        input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+        output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+
+        raw = (resp.output_text or "").strip()
+
+        # ---- Parse JSON ----
+        try:
+            agent_output = parse_json_loose(raw)
+            return agent_output, latency_ms, input_tokens, output_tokens, True, ""
+        except Exception as je:
+            # JSON parse failure — return raw text in error
+            return {}, latency_ms, input_tokens, output_tokens, False, f"json_parse_error: {je}; raw={raw[:300]}"
+
+    except Exception as e:
+        t1 = time.time()
+        latency_ms = (t1 - t0) * 1000.0
+        return {}, latency_ms, 0, 0, False, f"openai_error: {repr(e)}"
+
+# json sanitizer to strip code fences and other common wrappers
+# that might cause json parsing to fail (clean json output from model)
+def parse_json_loose(raw: str) -> dict:
+    s = (raw or "").strip()
+
+    # Strip ```json ... ``` or ``` ... ```
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)   # remove opening fence + optional "json"
+        s = re.sub(r"\s*```$", "", s)                 # remove closing fence
+        s = s.strip()
+
+    # If model wrote extra text, extract first JSON object
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        s = s[start:end+1]
+
+    return json.loads(s)
 
 def _project_relpath(path: str, root: str) -> str:
     """
@@ -253,12 +337,20 @@ def _project_relpath(path: str, root: str) -> str:
     except Exception:
         return path
 
-
-def make_csv_row(job: EvalJob, agent_output: Dict[str, Any], root: str) -> Dict[str, Any]:
-    """
-    Convert (job + agent_output) into a single flat CSV row.
-    For now: no scoring, no tokens, no real latency. Just plumbing.
-    """
+"""
+Convert (job + agent_output) into a single flat CSV row.
+Includes scoring, tokens, real latency.
+"""
+def make_csv_row(
+    job: EvalJob,
+    agent_output: Dict[str, Any],
+    root: str,
+    latency_ms: float,
+    input_tokens: int,
+    output_tokens: int,
+    parse_ok: bool,
+    error: str,
+) -> Dict[str, Any]:
     row: Dict[str, Any] = {k: "" for k in CSV_COLUMNS}
 
     row["id"] = job.sample.id
@@ -268,17 +360,20 @@ def make_csv_row(job: EvalJob, agent_output: Dict[str, Any], root: str) -> Dict[
     row["img_path"] = _project_relpath(job.sample.img_path, root)
     row["json_path"] = _project_relpath(job.sample.json_path, root)
 
-    # pretend we did work
-    row["parse_ok"] = 1
-    row["error"] = ""
+    row["latency_ms"] = round(latency_ms, 2)
+    row["input_tokens"] = input_tokens
+    row["output_tokens"] = output_tokens
 
-    # Fill guardrail outputs if present
+    row["parse_ok"] = 1 if parse_ok else 0
+    row["error"] = error
+
+    # inputGuardrail fields
     for k in ["is_food", "no_pii", "no_humans", "no_captcha"]:
         if k in agent_output:
             row[k] = agent_output[k]
 
-    # Fill mealAnalysis outputs if present
-    if "recommendation" in agent_output:
+    # mealAnalysis fields
+    if job.agent == "mealAnalysis":
         row["recommendation"] = agent_output.get("recommendation", "")
         row["meal_title"] = agent_output.get("meal_title", "")
         row["meal_description"] = agent_output.get("meal_description", "")
@@ -291,6 +386,7 @@ def make_csv_row(job: EvalJob, agent_output: Dict[str, Any], root: str) -> Dict[
         row["proteins"] = macros.get("proteins", "")
 
     return row
+
 
 # CSV writing utilities: write header once, then append rows as we go
 # Will ovewrrite existing output CSV file if it exists
@@ -305,6 +401,30 @@ def append_csv_rows(path: str, rows: List[Dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         for r in rows:
             writer.writerow(r)
+
+"""METHODS FOR CONNECTING TO OPENAI AND MAKING API CALLS"""
+def require_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        raise RuntimeError(
+            f"Missing environment variable {name}. "
+            f"Set it, e.g. export {name}='...'"
+        )
+    return val
+
+def image_to_base64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+def build_openai_client(root: str) -> OpenAI:
+    # Load .env from project root (if present)
+    load_dotenv(dotenv_path=os.path.join(root, ".env"), override=False)
+
+    api_key = require_env("OPENAI_API_KEY")
+    org_id = os.getenv("OPENAI_ORG_ID") or None
+
+    return OpenAI(api_key=api_key, organization=org_id)
+
 
 def main():
     # file lives in evals/eval_agents.py -> project root is one level up from evals/
@@ -334,15 +454,24 @@ def main():
     out_csv = os.path.join(root, "outputs", "results.csv")
     write_csv_header(out_csv)
 
-    # next safe step: run just a handful of jobs with dummy outputs
+    # Build OpenAI client once
+    client = build_openai_client(root)
+
+    # Pick 10 random jobs (reproducible seed)
+    random.seed(42)
+    k = min(10, len(jobs))
+    selected_jobs = random.sample(jobs, k=k)
+
     rows: List[Dict[str, Any]] = []
-    for job in jobs[:10]:
-        agent_output = run_agent(job)         # stubbed (no OpenAI)
-        row = make_csv_row(job, agent_output, root) # flatten for CSV
+    for job in selected_jobs:
+        agent_output, latency_ms, in_tok, out_tok, parse_ok, err = run_agent(job, client)
+        row = make_csv_row(job, agent_output, root, latency_ms, in_tok, out_tok, parse_ok, err)
         rows.append(row)
 
+        print(f"Ran job: agent={job.agent} model={job.model} id={job.sample.id} parse_ok={parse_ok}")
+
     append_csv_rows(out_csv, rows)
-    print(f"Wrote {len(rows)} dummy rows to {out_csv}")
+    print(f"Wrote {len(rows)} REAL rows to {out_csv}")
         
 
 if __name__ == "__main__":
