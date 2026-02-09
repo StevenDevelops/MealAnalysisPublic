@@ -190,6 +190,7 @@ def build_jobs(samples: List[Sample], agents: List[AgentConfig]) -> List[EvalJob
 
 def dry_run_print_jobs(jobs: List[EvalJob], n: int = 10) -> None:
     print(f"Planned {len(jobs)} eval jobs total.")
+    print("We'll print a few jobs so we know the harness is correct before we run all the API calls.")
     for j in jobs[:n]:
         print(f"- agent={j.agent} io={j.io} model={j.model} sample_id={j.sample.id}")
 
@@ -557,6 +558,19 @@ def main():
         default=DEFAULT_CONFIG_PATH,
         help=f"Path to YAML agent config (default: {DEFAULT_CONFIG_PATH})",
     )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Randomly select N samples from dataset before building jobs. "
+        "Default: run all samples.",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=12,
+        help="Random seed used only when --num-samples is set (default: 12).",
+    )
     args = parser.parse_args()
 
     # file lives in evals/eval_agents.py -> project root is one level up from evals/
@@ -566,6 +580,23 @@ def main():
         config_path = os.path.join(root, config_path)
 
     samples = load_dataset(root)
+    total_samples = len(samples)
+
+    if args.num_samples is not None:
+        if args.num_samples <= 0:
+            raise RuntimeError("--num-samples must be > 0")
+        if args.num_samples > total_samples:
+            raise RuntimeError(
+                f"--num-samples={args.num_samples} exceeds available samples ({total_samples})"
+            )
+        random.seed(args.sample_seed)
+        samples = random.sample(samples, k=args.num_samples)
+        print(
+            f"Selected {len(samples)} random sample(s) out of {total_samples} "
+            f"(seed={args.sample_seed})."
+        )
+    else:
+        print(f"Using all {total_samples} samples (no random subsampling).")
 
     print(f"Loaded {len(samples)} valid samples.")
     for s in samples[:5]:
@@ -589,14 +620,11 @@ def main():
 
     # Build OpenAI client once
     client = build_openai_client(root)
-
-    # Pick 10 random jobs (reproducible seed)
-    random.seed(12)
-    k = min(20, len(jobs))
-    selected_jobs = random.sample(jobs, k=k)
-
+    
+    print('============ Staring agent evals... may take a while ============')
     rows: List[Dict[str, Any]] = []
-    for job in selected_jobs:
+    total_jobs = len(jobs)
+    for idx, job in enumerate(jobs, start=1):
         agent_output, latency_ms, in_tok, out_tok, parse_ok, err, raw = run_agent(job, client)
         row = make_csv_row(
             job, agent_output, root,
@@ -605,7 +633,10 @@ def main():
         )
         rows.append(row)
 
-        print(f"Ran job: agent={job.agent} model={job.model} id={job.sample.id} parse_ok={parse_ok}")
+        print(
+            f"[{idx}/{total_jobs}] Ran job: "
+            f"agent={job.agent} model={job.model} id={job.sample.id} parse_ok={parse_ok}"
+        )
 
     append_csv_rows(out_csv, rows)
     print(f"Wrote {len(rows)} REAL rows to {out_csv}")

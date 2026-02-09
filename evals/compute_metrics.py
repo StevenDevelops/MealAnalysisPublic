@@ -36,6 +36,7 @@ SCORE_COLUMNS = [
     "text_quality_0_100",
     "meal_composite_0_100",
 ]
+SCORING_WARNING_COLUMN = "scoring_warning"
 
 DEFAULT_JUDGE_MODEL = "gpt-4.1-mini"
 
@@ -302,6 +303,10 @@ def score_boolean_exact(
     return 1
 
 
+def _missing_required_bool_keys(gt_obj: Dict[str, Any], keys: List[str]) -> List[str]:
+    return [k for k in keys if not isinstance(gt_obj.get(k), bool)]
+
+
 def score_macros(pred_row: Dict[str, Any], gt_meal: Dict[str, Any]) -> Optional[float]:
     gt_macros = gt_meal.get("macros", {})
     if not isinstance(gt_macros, dict):
@@ -424,6 +429,7 @@ def _score_one_row(
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {k: np.nan for k in SCORE_COLUMNS}
     out["_skipped"] = 0
+    out["_scoring_warning"] = ""
 
     agent = _canonical_agent(_clean_str(row.get("agent", "")))
     json_path_val = _clean_str(row.get("json_path", ""))
@@ -442,9 +448,17 @@ def _score_one_row(
 
     if agent == "inputGuardrail":
         gt_guard = gt.get("guardrailCheck", {})
+        if not isinstance(gt_guard, dict):
+            gt_guard = {}
+        missing_keys = _missing_required_bool_keys(gt_guard, GUARDRAIL_KEYS)
+        if missing_keys:
+            out["_scoring_warning"] = (
+                f"missing ground truth guardrail keys: {', '.join(missing_keys)}"
+            )
+            return out
         guard_pass = score_boolean_exact(
             row_dict,
-            gt_guard if isinstance(gt_guard, dict) else {},
+            gt_guard,
             GUARDRAIL_KEYS,
         )
         out["guardrail_pass"] = np.nan if guard_pass is None else float(guard_pass)
@@ -452,9 +466,17 @@ def _score_one_row(
 
     if agent == "outputGuardrail":
         gt_safe = gt.get("safetyChecks", {})
+        if not isinstance(gt_safe, dict):
+            gt_safe = {}
+        missing_keys = _missing_required_bool_keys(gt_safe, SAFETY_KEYS)
+        if missing_keys:
+            out["_scoring_warning"] = (
+                f"missing ground truth safety keys: {', '.join(missing_keys)}"
+            )
+            return out
         safety_pass = score_boolean_exact(
             row_dict,
-            gt_safe if isinstance(gt_safe, dict) else {},
+            gt_safe,
             SAFETY_KEYS,
         )
         out["safety_pass"] = np.nan if safety_pass is None else float(safety_pass)
@@ -625,6 +647,8 @@ def main() -> None:
     for col in SCORE_COLUMNS:
         if col not in df.columns:
             df[col] = np.nan
+    if SCORING_WARNING_COLUMN not in df.columns:
+        df[SCORING_WARNING_COLUMN] = ""
 
     if "agent" in df.columns:
         df["agent"] = df["agent"].astype(str).map(_canonical_agent)
@@ -672,6 +696,10 @@ def main() -> None:
     skipped_rows = int(pd.to_numeric(score_records["_skipped"], errors="coerce").fillna(0).sum())
     for col in SCORE_COLUMNS:
         df[col] = score_records[col]
+    df[SCORING_WARNING_COLUMN] = score_records["_scoring_warning"].fillna("")
+
+    warning_mask = df[SCORING_WARNING_COLUMN].astype(str).str.strip().ne("")
+    warning_count = int(warning_mask.sum())
 
     os.makedirs(os.path.dirname(out_scored_csv), exist_ok=True)
     df.to_csv(out_scored_csv, index=False, na_rep="")
@@ -683,6 +711,23 @@ def main() -> None:
 
     print(f"Scored rows: {len(df)}")
     print(f"Skipped rows: {skipped_rows}")
+    if warning_count:
+        print(
+            f"WARNING: {warning_count} row(s) had missing ground truth keys "
+            "and were left unscored for that metric."
+        )
+        preview = df.loc[
+            warning_mask,
+            ["id", "agent", "model", "json_path", SCORING_WARNING_COLUMN],
+        ]
+        max_preview = 20
+        for _, wr in preview.head(max_preview).iterrows():
+            print(
+                f"- id={wr['id']} agent={wr['agent']} model={wr['model']} "
+                f"reason={wr[SCORING_WARNING_COLUMN]}"
+            )
+        if warning_count > max_preview:
+            print(f"... and {warning_count - max_preview} more warning row(s).")
     print(
         f"Judge calls: {judge_calls} "
         f"(skipped parse/text-empty meal rows: {judge_skipped})"

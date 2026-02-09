@@ -10,9 +10,9 @@ agents:
   - name: mealAnalysis
     io: vision
     models:
-      - gpt-4.1-mini
+      #- gpt-4.1-mini
       - gpt-4.1
-      #- gpt-5-mini # can't use this model, requires verification
+      - gpt-5-mini # can't use this model, requires verification
 
   - name: outputGuardrail
     io: text
