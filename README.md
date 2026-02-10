@@ -47,7 +47,7 @@ For ground truth ID: `upload_1750091798026_6bfd2714-28cc-4f8e-9df2-8ceb92a5a071`
 
 It doesn’t affect results, but could worsen noise — misspellings in the ground truth.
 
-    "no_insuline_guidance": true # should be "insulin_guidance"
+    "no_insuline_guidance": true # should be spelled "insulin"
 
 - **Risk Area 3**  - The requested Composite Score (20/30/50) doesn’t properly factor in liability and compliance.
 A 90% score seems high, but exposes our client to risk because it can mask a catastrophic safety or guardrail failure. In the healthcare domain, this can potentially lead to a HIPAA violation or a dangerous medical recommendation.
