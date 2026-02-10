@@ -28,14 +28,15 @@ The ground truth for inputGuardrails and outputGuardrails are missing or noisy, 
 
 The ground truth is compromised, so the standard at which we measure model accuracy is **compromised** (Degenerate Dataset)**,** thus the evaluation scores are largely **incomplete** and not reliable because it exposes our health client to legal health risk, liability, and potential HIPAA violations for the following reasons:
 
-- Risk Area 1 - Missing ground truths for failed Safety Checks and Guardrail Checks
-i. There are no cases for `is_food: false` , `no_humans: false` etc in Safety Checks.
-ii. There are no cases of “harmful inputs” of `treatment recommendations` or `judgmental language` that should be redacted for Guardrail Checks.
+- **Risk Area 1** - Missing ground truths for failed Safety Checks and Guardrail Checks
+    - i. There are no cases for `is_food: false` , `no_humans: false` etc in Safety Checks.
+    - ii. There are no cases of “harmful inputs” of `treatment recommendations` or `judgmental language` that should be redacted for Guardrail Checks
+    - iii. I don't have ground truth for production level output from mealAnalysis, so output guardrail was evaluated against ground-truth meal text to isolate guardrail classification behavior; this technically is not full end-to-end guardrail-on-generated-output evaluation.
 
 Some json files are missing ground truths for a specific agent, such in 
 `upload_1753054127030_3f2421d7-8517-4a68-a37e-f2c3fae607db.json` we see
 `"safetyChecks": {}`
-- Risk Area 2 - **Labels are noisy or incorrect.**
+- **Risk Area 2** - **Labels are noisy or incorrect.**
 For example, some images are labeled with `no_humans: true` (meaning "there are no humans here"), but show human hands, showing noisy or incorrect label for `no_humans` 
 
 Ground truth ID’s: `upload_1752265287016_4c47aab8-77a8-42e6-a937-2a4b5be3c7d8`, `upload_1752265866541_68a737f3-abd3-461c-9b6b-85cb1dfc31c7`
@@ -48,7 +49,7 @@ It doesn’t affect results, but could worsen noise — misspellings in the grou
 
     `"no_insuline_guidance": true` # should be "insulin_guidance"
 
-- Risk Area 3  - The requested Composite Score (20/30/50) doesn’t properly factor in liability and compliance.
+- **Risk Area 3**  - The requested Composite Score (20/30/50) doesn’t properly factor in liability and compliance.
 A 90% score seems high, but exposes our client to risk because it can mask a catastrophic safety or guardrail failure. In the healthcare domain, this can potentially lead to a HIPAA violation or a dangerous medical recommendation.
 
 ## Eval Platform Chosen
@@ -88,7 +89,7 @@ Alternatively for testing, you can run a few samples (take parts of the test), e
 **Step 2** -
 Score evals (compare the answers against the test answer key, and output overall scores in `results_scored.csv` and `agent_model_summary.csv`)
 ```
-python score_evals.py
+python evals/score_evals.py
 ```
 
 ### Output Files
