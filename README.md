@@ -3,7 +3,7 @@
 ## Goal and Summary
 
 - This project is intended to look for the best performing models based on evaluation scores, recommend an architecture to the client, and highlight any warnings and limitations of the evidence and conclusions.
-- If you’re looking for a condensed summary of the project findings, please look at `evaluation_results.ipynb` at the project root
+- **Evaluation Results** are in `evaluation_results.ipynb` at the project root, which is a condensed summary of the project findings
 
 ## Eval Platform Chosen
 
