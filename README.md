@@ -73,8 +73,8 @@ Higher eval score, less latency
 3. For outputGuardrails → **gpt-4.1-nano** performed better
 Higher eval score, less latency
 
-> Warnings: 
-1. **This is an interim recommendation.** 
+> WARNINGS:
+1. **This is an interim recommendation.**
 For mealAnalysis, gpt-4.1 performed better than gpt-5-mini, but the composite mealAnalysis scores for both aren’t high, which may not fulfill the client’s needs. The mealAnalysis score is mainly dragged down by ingredient-level matching quality, which suggests that based on food images, the models have a hard time identifying the ingredients.
 **Further research needs to be done to see if heavier-weight models (besides gpt-5-mini) score better.**
 
