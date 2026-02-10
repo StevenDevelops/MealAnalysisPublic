@@ -1,3 +1,11 @@
+"""
+    Author: Steven Bonilla
+    File summary:
+    This script runs the evaluation harness for the meal analysis project for each
+    (agent, model) tuple on the sample dataset. It loads the dataset from local files,
+    builds a list of evaluation jobs, calls the OpenAI API for each job, parses the outputs, 
+    and writes results to a CSV file.
+"""
 import csv
 import time
 import os

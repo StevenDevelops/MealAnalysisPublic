@@ -1,3 +1,12 @@
+"""
+    Author: Steven Bonilla
+    File summary:
+    This script compares predicted outputs against ground truth data. 
+    It computes various scores such as guardrail/safety pass rates, 
+    macro nutrient accuracy, ingredient accuracy, and text quality (using an LLM judge). 
+    The script handles missing or malformed data gracefully, skipping scoring when necessary and logging warnings. 
+    Finally, it outputs a scored CSV and a summary CSV with average scores by agent and model.
+"""
 import argparse
 import json
 import os
@@ -370,7 +379,10 @@ def score_ingredients(pred_row: Dict[str, Any], gt_meal: Dict[str, Any]) -> Opti
     matched = sum(min(exp_counter[p], pred_counter[p]) for p in exp_counter)
     return round((matched / len(expected_pairs)) * 100.0, 2)
 
-
+# Compute overall meal score as a weighted average of:
+# - 50% recommendation exact (100/0)
+# - 30% average of {description, guidance, title}
+# - 20% average of {macros_score_0_100, ingredients_accuracy_0_100}
 def score_meal_row(
     row: Dict[str, Any],
     gt_meal: Dict[str, Any],

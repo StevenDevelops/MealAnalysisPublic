@@ -5,6 +5,52 @@
 - This project is intended to look for the best performing models based on evaluation scores, recommend an architecture to the client, and highlight any warnings and limitations of the evidence and conclusions, and next steps.
 - **Evaluation Results** are in `evaluation_results.ipynb` at the project root, which is a condensed summary of the project findings
 
+## Selected Models
+
+Based on the evaluation scores:
+
+1. For inputGuardrails → **gpt-4.1-mini** performed better.
+Higher eval score, less latency
+2. For mealAnalysis → **gpt-4.1** performed better.
+Higher eval score, less latency
+3. For outputGuardrails → **gpt-4.1-nano** performed better.
+Higher eval score, less latency
+
+> WARNINGS:
+1. **This is an interim recommendation.**
+For mealAnalysis, gpt-4.1 performed better than gpt-5-mini, but the composite mealAnalysis scores for both aren’t high, which may not fulfill the client’s needs. The mealAnalysis score is mainly dragged down by ingredient-level matching quality, which suggests that based on food images, the models have a hard time identifying the ingredients.
+**Further research needs to be done to see if heavier-weight models (besides gpt-5-mini) score better.**
+
+2. **mealAnalysis is likely the most meaningful evaluation here.** 
+The ground truth for inputGuardrails and outputGuardrails are missing or noisy, so these evaluation scores are largely incomplete. Please see below for more details on why that is.
+
+## Major Risk, Liability Warning
+
+The ground truth is compromised, so the standard at which we measure model accuracy is **compromised** (Degenerate Dataset)**,** thus the evaluation scores are largely **incomplete** and not reliable because it exposes our health client to legal health risk, liability, and potential HIPAA violations for the following reasons:
+
+- Risk Area 1 - Missing ground truths for failed Safety Checks and Guardrail Checks
+i. There are no cases for `is_food: false` , `no_humans: false` etc in Safety Checks.
+ii. There are no cases of “harmful inputs” of `treatment recommendations` or `judgmental language` that should be redacted for Guardrail Checks.
+
+Some json files are missing ground truths for a specific agent, such in 
+`upload_1753054127030_3f2421d7-8517-4a68-a37e-f2c3fae607db.json` we see
+`"safetyChecks": {}`
+- Risk Area 2 - **Labels are noisy or incorrect.**
+For example, some images are labeled with `no_humans: true` (meaning "there are no humans here"), but show human hands, showing noisy or incorrect label for `no_humans` 
+
+Ground truth ID’s: `upload_1752265287016_4c47aab8-77a8-42e6-a937-2a4b5be3c7d8`, `upload_1752265866541_68a737f3-abd3-461c-9b6b-85cb1dfc31c7`
+
+Another example, the ground truth mealAnalysis includes text that violates the constraint “no medical claims”, yet has (e.g., “poor choice for diabetics… consult a healthcare provider”) and `safetyChecks.no_treatment_recommendation` and other safety booleans are `true`. That’s label inconsistency that impacts both eval validity and output scoring.
+
+For ground truth ID: `upload_1750091798026_6bfd2714-28cc-4f8e-9df2-8ceb92a5a071` 
+
+It doesn’t affect results, but could worsen noise — misspellings in the ground truth.
+
+    `"no_insuline_guidance": true` # should be "insulin_guidance"
+
+- Risk Area 3  - The requested Composite Score (20/30/50) doesn’t properly factor in liability and compliance.
+A 90% score seems high, but exposes our client to risk because it can mask a catastrophic safety or guardrail failure. In the healthcare domain, this can potentially lead to a HIPAA violation or a dangerous medical recommendation.
+
 ## Eval Platform Chosen
 
 **I chose to write a custom evaluation harness in Python** because:
@@ -14,7 +60,12 @@
 
 ## Setup Instructions
 
-**Step 0** - install dependencies, and start a conda environment. I developed in MACOS environment, so dependencies or scripts may break if ran on another OS eg Windows.
+**Step 0.0** - make sure you have an OpenAI API key in an `.env` file at project root. If you don't have this, OpenAI calls will fail
+```
+OPENAI_API_KEY=<your OpenAI API key goes here>
+```
+
+**Step 0.1** - install dependencies, and start a conda environment. I developed in MACOS environment, so dependencies or scripts may break if ran on another OS eg Windows.
 
 ```
 conda env create -f environment.yml
@@ -71,26 +122,6 @@ Rationale for linear architecture, or linear pipeline:
 Alternate considerations for the future:
 
 - Running agents 1 and 2 in parallel to reduce end-to-end user latency. However, this creates significant complexity in coordinating asynchronous architecture, which is an additional cost and complexity.
-
-## Selected Models
-
-Based on the evaluation scores:
-
-1. For inputGuardrails → **gpt-4.1-mini** performed better
-Higher eval score, less latency
-2. For mealAnalysis → **gpt-4.1** performed better
-Higher eval score, less latency
-3. For outputGuardrails → **gpt-4.1-nano** performed better
-Higher eval score, less latency
-
-> WARNINGS:
-1. **This is an interim recommendation.**
-For mealAnalysis, gpt-4.1 performed better than gpt-5-mini, but the composite mealAnalysis scores for both aren’t high, which may not fulfill the client’s needs. The mealAnalysis score is mainly dragged down by ingredient-level matching quality, which suggests that based on food images, the models have a hard time identifying the ingredients.
-**Further research needs to be done to see if heavier-weight models (besides gpt-5-mini) score better.**
-
-2. **mealAnalysis is likely the most meaningful evaluation here.** 
-The ground truth for inputGuardrails and outputGuardrails are missing or noisy, so these evaluation scores are largely incomplete. Please see below for more details on why that is.
-> 
 
 ## Future improvements on scripts
 
