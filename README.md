@@ -2,7 +2,7 @@
 
 ## Goal and Summary
 
-- This project is intended to look for the best performing models based on evaluation scores, recommend an architecture to the client, and highlight any warnings and limitations of the evidence and conclusions.
+- This project is intended to look for the best performing models based on evaluation scores, recommend an architecture to the client, and highlight any warnings and limitations of the evidence and conclusions, and next steps.
 - **Evaluation Results** are in `evaluation_results.ipynb` at the project root, which is a condensed summary of the project findings
 
 ## Eval Platform Chosen
@@ -14,21 +14,31 @@
 
 ## Setup Instructions
 
-- Step 0 - install dependencies, and start a conda environment
-`conda env create -f environment.yml`
-`conda activate healthevals`
-- Step 1
-Run evaluations (have models take the test and save answers to `outputs/results.csv`)
-`python evals/run_evals.py`  *This may take a while…*
+**Step 0** - install dependencies, and start a conda environment. I developed in MACOS environment, so dependencies or scripts may break if ran on another OS eg Windows.
+
+```
+conda env create -f environment.yml
+conda activate healthevals
+```
+
+**Step 1** - Run evaluations (have models take the test and save answers to `outputs/results.csv`)
+*This may take a while…*
+```
+python evals/run_evals.py
+```
 
 Inside `agent_models.yaml`, we see which models will be evaluated.
 *Some models have usage, quota, or API restrictions, so if you change the model, the following scripts may not be able to run. You can leave this file as is.*
 
-Alternatively for testing, you can run a few samples (take parts of the test), e.g., 10 samples for each (agent, model) tuple, such as below:
+Alternatively for testing, you can run a few samples (take parts of the test), e.g., 10 samples for each (agent, model) tuple, using the `--num-samples` flag:
 `python evals/run_evals.py --num-samples 10`
-- Step 2
+
+
+**Step 2** -
 Score evals (compare the answers against the test answer key, and output overall scores in `results_scored.csv` and `agent_model_summary.csv`)
-`python score_evals.py`
+```
+python score_evals.py
+```
 
 ### Output Files
 
