@@ -1,7 +1,9 @@
 agent,model,n_rows,n_scored,eval_score,avg_input_tokens,avg_output_tokens,p50_latency_ms
-inputGuardrail,gpt-4.1,72,72,93.06,313.0,35.0,1486.26
-inputGuardrail,gpt-4.1-mini,72,72,95.83,474.0,26.92,1234.4
-mealAnalysis,gpt-4.1,72,72,68.07,361.0,201.72,6504.48
-mealAnalysis,gpt-5-mini,72,72,54.18,413.0,837.83,9785.68
-outputGuardrail,gpt-4.1-mini,72,64,4.69,188.07,71.0,1500.94
-outputGuardrail,gpt-4.1-nano,72,64,37.5,188.07,71.0,940.99
+inputGuardrail,gpt-4.1-mini,72,72,98.61,474.0,26.92,1442.46
+mealAnalysis,gpt-4.1,72,72,44.96,361.0,196.94,3081.82
+mealAnalysis,gpt-4.1-mini,72,72,33.48,522.0,198.43,4105.24
+mealAnalysis,gpt-4o,72,72,39.12,361.0,178.1,5530.54
+mealAnalysis,gpt-5,72,72,35.7,315.0,1022.03,15342.92
+mealAnalysis,gpt-5-mini,72,72,32.05,413.0,854.69,12230.51
+mealAnalysis,gpt-5.2-pro,72,72,30.81,378.58,352.0,23773.54
+outputGuardrail,gpt-4.1-nano,72,64,6.25,21.96,7.89,17330.19
