@@ -1,0 +1,7 @@
+agent,model,n_rows,n_scored,eval_score,avg_input_tokens,avg_output_tokens,p50_latency_ms
+inputGuardrail,gpt-4.1,72,72,93.06,313.0,35.0,1486.26
+inputGuardrail,gpt-4.1-mini,72,72,95.83,474.0,26.92,1234.4
+mealAnalysis,gpt-4.1,72,72,68.07,361.0,201.72,6504.48
+mealAnalysis,gpt-5-mini,72,72,54.18,413.0,837.83,9785.68
+outputGuardrail,gpt-4.1-mini,72,64,4.69,188.07,71.0,1500.94
+outputGuardrail,gpt-4.1-nano,72,64,37.5,188.07,71.0,940.99

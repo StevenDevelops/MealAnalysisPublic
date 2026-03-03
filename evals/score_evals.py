@@ -5,7 +5,8 @@
     It computes various scores such as guardrail/safety pass rates, 
     macro nutrient accuracy, ingredient accuracy, and text quality (using an LLM judge). 
     The script handles missing or malformed data gracefully, skipping scoring when necessary and logging warnings. 
-    Finally, it outputs a scored CSV and a summary CSV with average scores by agent and model.
+    Finally, it outputs a scored CSV, a summary CSV with average scores by agent and model,
+    and an ingredient semantic audit CSV for manual inspection.
 """
 import argparse
 import json
@@ -18,6 +19,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
+import yaml
 
 # ---- Canonical keys ----
 GUARDRAIL_KEYS = ["is_food", "no_pii", "no_humans", "no_captcha"]
@@ -48,6 +50,15 @@ SCORE_COLUMNS = [
 SCORING_WARNING_COLUMN = "scoring_warning"
 
 DEFAULT_JUDGE_MODEL = "gpt-4.1-mini"
+DEFAULT_INGREDIENTS_MATCHER_MODEL = "gpt-4.1-mini"
+DEFAULT_INGREDIENTS_BATCH_SIZE = 10
+DEFAULT_AGENT_CONFIG_PATH = os.path.join("evals", "agent_models.yaml")
+INGREDIENTS_AUDIT_COLUMNS = [
+    "sample_id",
+    "model_output_ingredients",
+    "ground_truth_ingredients",
+    "ingredients_accuracy_0_100",
+]
 
 def _clean_str(v: Any) -> str:
     if v is None:
@@ -186,6 +197,59 @@ def _build_openai_client(root: str) -> OpenAI:
     api_key = _require_env("OPENAI_API_KEY")
     org_id = os.getenv("OPENAI_ORG_ID") or None
     return OpenAI(api_key=api_key, organization=org_id)
+
+
+def _load_yaml_dict(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        obj = yaml.safe_load(f)
+    return obj if isinstance(obj, dict) else {}
+
+
+def _to_positive_int(v: Any) -> Optional[int]:
+    if isinstance(v, int) and v > 0:
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s.isdigit():
+            i = int(s)
+            if i > 0:
+                return i
+    return None
+
+
+def _load_ingredients_matcher_config(
+    root: str,
+    cli_model: Optional[str],
+    cli_batch_size: Optional[int],
+) -> Tuple[str, int]:
+    model = DEFAULT_INGREDIENTS_MATCHER_MODEL
+    batch_size = DEFAULT_INGREDIENTS_BATCH_SIZE
+
+    config_path = os.path.join(root, DEFAULT_AGENT_CONFIG_PATH)
+    try:
+        cfg = _load_yaml_dict(config_path)
+        matcher_cfg = cfg.get("ingredients_matcher", {})
+        if isinstance(matcher_cfg, dict):
+            yaml_model = matcher_cfg.get("model")
+            if isinstance(yaml_model, str) and yaml_model.strip():
+                model = yaml_model.strip()
+            yaml_batch = _to_positive_int(matcher_cfg.get("batch_size"))
+            if yaml_batch is not None:
+                batch_size = yaml_batch
+    except Exception as e:
+        print(
+            f"WARNING: failed reading ingredients_matcher config from {config_path}: {e}",
+            flush=True,
+        )
+
+    if isinstance(cli_model, str) and cli_model.strip():
+        model = cli_model.strip()
+    if cli_batch_size is not None:
+        batch_size = max(1, int(cli_batch_size))
+
+    return model, batch_size
 
 
 def _supports_temperature(model: str) -> bool:
@@ -345,39 +409,211 @@ def score_macros(pred_row: Dict[str, Any], gt_meal: Dict[str, Any]) -> Optional[
     return round(_clamp01(1.0 - mape_avg) * 100.0, 2)
 
 
-def score_ingredients(pred_row: Dict[str, Any], gt_meal: Dict[str, Any]) -> Optional[float]:
-    expected = gt_meal.get("ingredients", [])
-    if not isinstance(expected, list):
-        return None
-
-    expected_pairs: List[Tuple[str, str]] = []
-    for item in expected:
+def _normalize_ingredient_items(raw_items: Any) -> List[Dict[str, str]]:
+    if not isinstance(raw_items, list):
+        return []
+    normalized: List[Dict[str, str]] = []
+    for item in raw_items:
         if not isinstance(item, dict):
             continue
         name = _normalize_name(item.get("name"))
         impact = _normalize_label(item.get("impact"))
         if name is None or impact is None:
             continue
-        expected_pairs.append((name, impact))
+        normalized.append({"name": name, "impact": impact})
+    return normalized
 
+
+def _score_ingredients_strict_from_items(
+    expected_items: List[Dict[str, str]],
+    pred_items: List[Dict[str, str]],
+) -> Optional[float]:
+    expected_pairs = [(x["name"], x["impact"]) for x in expected_items]
     if not expected_pairs:
         return None
-
-    pred_items = _parse_ingredients_json(pred_row.get("ingredients_json"))
-    pred_pairs: List[Tuple[str, str]] = []
-    for item in pred_items:
-        if not isinstance(item, dict):
-            continue
-        name = _normalize_name(item.get("name"))
-        impact = _normalize_label(item.get("impact"))
-        if name is None or impact is None:
-            continue
-        pred_pairs.append((name, impact))
-
+    pred_pairs = [(x["name"], x["impact"]) for x in pred_items]
     exp_counter = Counter(expected_pairs)
     pred_counter = Counter(pred_pairs)
     matched = sum(min(exp_counter[p], pred_counter[p]) for p in exp_counter)
     return round((matched / len(expected_pairs)) * 100.0, 2)
+
+
+def _build_ingredients_batch_prompt(batch_payload: List[Dict[str, Any]]) -> str:
+    samples_json = json.dumps(batch_payload, ensure_ascii=False)
+    return (
+        "You are grading semantic ingredient matching for meal analysis.\n"
+        "For each sample, match predicted ingredients to expected ingredients based on ingredient meaning.\n"
+        "Treat minor wording differences as equivalent (e.g., singular/plural, spelling variants, preparation style).\n"
+        "Examples: tomato/tomatoes, egg/scrambled eggs, yogurt/yoghurt, cilantro/coriander.\n"
+        "A match counts ONLY when ingredient meaning matches and impact label is the same.\n"
+        "Use one-to-one matching (an expected item can match at most one predicted item, and vice versa).\n"
+        "Return ONLY valid JSON in this exact shape:\n"
+        "{\n"
+        '  "results": [\n'
+        "    {\n"
+        '      "sample_key": "<string>",\n'
+        '      "matched_expected_count": <integer>,\n'
+        '      "expected_count": <integer>\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "SAMPLES:\n"
+        f"{samples_json}\n"
+    )
+
+
+def _score_ingredients_semantic_batch(
+    client: OpenAI,
+    matcher_model: str,
+    batch_payload: List[Dict[str, Any]],
+) -> Dict[str, float]:
+    prompt = _build_ingredients_batch_prompt(batch_payload)
+    try:
+        resp = _create_response(
+            client=client,
+            model=matcher_model,
+            input_payload=prompt,
+        )
+        raw = (resp.output_text or "").strip()
+        parsed = _parse_json_loose(raw)
+        results = parsed.get("results")
+        if not isinstance(results, list):
+            return {}
+
+        expected_count_lookup: Dict[str, int] = {
+            str(x.get("sample_key")): int(x.get("expected_count", 0))
+            for x in batch_payload
+        }
+
+        scores: Dict[str, float] = {}
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            sample_key = _clean_str(item.get("sample_key"))
+            if not sample_key:
+                continue
+
+            expected_count = _to_positive_int(item.get("expected_count"))
+            if expected_count is None:
+                expected_count = expected_count_lookup.get(sample_key)
+            if not expected_count:
+                continue
+
+            matched_raw = _to_float(item.get("matched_expected_count"))
+            if matched_raw is None:
+                continue
+            matched_count = int(round(matched_raw))
+            matched_count = max(0, min(expected_count, matched_count))
+            score = round((matched_count / expected_count) * 100.0, 2)
+            scores[sample_key] = score
+        return scores
+    except Exception:
+        # Keep scoring pipeline moving; caller handles fallback behavior.
+        return {}
+
+
+def build_semantic_ingredients_scores(
+    df: pd.DataFrame,
+    root: str,
+    gt_cache: Dict[str, Dict[str, Any]],
+    client: OpenAI,
+    matcher_model: str,
+    batch_size: int,
+    progress_every: int,
+) -> Tuple[Dict[int, Optional[float]], int]:
+    score_by_row_index: Dict[int, Optional[float]] = {}
+    pending_rows: List[Dict[str, Any]] = []
+
+    for row_idx, row in df.iterrows():
+        agent = _canonical_agent(_clean_str(row.get("agent", "")))
+        if agent != "mealAnalysis":
+            continue
+
+        json_path_val = _clean_str(row.get("json_path", ""))
+        if not json_path_val:
+            score_by_row_index[row_idx] = None
+            continue
+
+        json_path = _resolve_path(root, json_path_val)
+        try:
+            gt = _load_ground_truth(json_path, gt_cache)
+        except Exception:
+            score_by_row_index[row_idx] = None
+            continue
+
+        gt_meal = gt.get("mealAnalysis", {})
+        if not isinstance(gt_meal, dict):
+            score_by_row_index[row_idx] = None
+            continue
+
+        expected_items = _normalize_ingredient_items(gt_meal.get("ingredients", []))
+        if not expected_items:
+            score_by_row_index[row_idx] = None
+            continue
+
+        pred_raw = _parse_ingredients_json(row.get("ingredients_json"))
+        pred_items = _normalize_ingredient_items(pred_raw)
+        if not pred_items:
+            score_by_row_index[row_idx] = 0.0
+            continue
+
+        strict_fallback = _score_ingredients_strict_from_items(
+            expected_items,
+            pred_items,
+        )
+        pending_rows.append(
+            {
+                "row_idx": row_idx,
+                "sample_key": str(row_idx),
+                "sample_id": _clean_str(row.get("id", "")),
+                "expected_count": len(expected_items),
+                "expected": expected_items,
+                "predicted": pred_items,
+                "strict_fallback": 0.0 if strict_fallback is None else strict_fallback,
+            }
+        )
+
+    if not pending_rows:
+        return score_by_row_index, 0
+
+    total_pending = len(pending_rows)
+    judge_calls = 0
+
+    for start in range(0, total_pending, max(1, batch_size)):
+        chunk = pending_rows[start : start + max(1, batch_size)]
+        payload = [
+            {
+                "sample_key": x["sample_key"],
+                "sample_id": x["sample_id"],
+                "expected_count": x["expected_count"],
+                "expected": x["expected"],
+                "predicted": x["predicted"],
+            }
+            for x in chunk
+        ]
+        batch_scores = _score_ingredients_semantic_batch(
+            client=client,
+            matcher_model=matcher_model,
+            batch_payload=payload,
+        )
+        judge_calls += 1
+
+        for item in chunk:
+            score = batch_scores.get(item["sample_key"])
+            if score is None:
+                score = item["strict_fallback"]
+            score_by_row_index[item["row_idx"]] = score
+
+        done = min(start + len(chunk), total_pending)
+        if done % progress_every == 0 or done == total_pending:
+            pct = int(round((done / total_pending) * 100))
+            print(
+                f"[ingredient-matcher] scored {done}/{total_pending} meal rows ({pct}%) "
+                f"in {judge_calls} batch call(s)",
+                flush=True,
+            )
+
+    return score_by_row_index, judge_calls
 
 # Compute overall meal score as a weighted average of:
 # - 50% recommendation exact (100/0)
@@ -387,6 +623,7 @@ def score_meal_row(
     row: Dict[str, Any],
     gt_meal: Dict[str, Any],
     text_quality_score: Optional[float],
+    ingredients_score: Optional[float],
 ) -> Dict[str, Optional[float]]:
     if not isinstance(gt_meal, dict):
         return {
@@ -406,7 +643,6 @@ def score_meal_row(
         recommendation_score = 100.0 if pred_rec == exp_rec else 0.0
 
     macros_score = score_macros(row, gt_meal)
-    ingredients_score = score_ingredients(row, gt_meal)
 
     structured_parts = [x for x in [macros_score, ingredients_score] if x is not None]
     structured_component = _mean(structured_parts)
@@ -438,6 +674,7 @@ def _score_one_row(
     gt_cache: Dict[str, Dict[str, Any]],
     client: OpenAI,
     judge_model: str,
+    ingredients_score: Optional[float],
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {k: np.nan for k in SCORE_COLUMNS}
     out["_skipped"] = 0
@@ -519,6 +756,7 @@ def _score_one_row(
             row_dict,
             gt_meal,
             text_quality_score=text_quality_score,
+            ingredients_score=ingredients_score,
         )
         for k in ["macros_score_0_100", "ingredients_accuracy_0_100", "text_quality_0_100", "meal_composite_0_100"]:
             v = meal_scores.get(k)
@@ -527,6 +765,51 @@ def _score_one_row(
 
     out["_skipped"] = 1
     return out
+
+
+def build_ingredients_audit_frame(
+    df: pd.DataFrame,
+    root: str,
+    gt_cache: Dict[str, Dict[str, Any]],
+    semantic_ingredients_scores: Dict[int, Optional[float]],
+) -> pd.DataFrame:
+    audit_rows: List[Dict[str, str]] = []
+
+    for row_idx, row in df.iterrows():
+        agent = _canonical_agent(_clean_str(row.get("agent", "")))
+        if agent != "mealAnalysis":
+            continue
+
+        sample_id = _clean_str(row.get("id", ""))
+        pred_items = _normalize_ingredient_items(
+            _parse_ingredients_json(row.get("ingredients_json"))
+        )
+
+        gt_items: List[Dict[str, str]] = []
+        json_path_val = _clean_str(row.get("json_path", ""))
+        if json_path_val:
+            json_path = _resolve_path(root, json_path_val)
+            try:
+                gt = _load_ground_truth(json_path, gt_cache)
+                gt_meal = gt.get("mealAnalysis", {})
+                if isinstance(gt_meal, dict):
+                    gt_items = _normalize_ingredient_items(gt_meal.get("ingredients", []))
+            except Exception:
+                gt_items = []
+
+        score = semantic_ingredients_scores.get(row_idx)
+        score_str = "" if score is None else f"{float(score):.2f}"
+
+        audit_rows.append(
+            {
+                "sample_id": sample_id,
+                "model_output_ingredients": json.dumps(pred_items, ensure_ascii=False),
+                "ground_truth_ingredients": json.dumps(gt_items, ensure_ascii=False),
+                "ingredients_accuracy_0_100": score_str,
+            }
+        )
+
+    return pd.DataFrame(audit_rows, columns=INGREDIENTS_AUDIT_COLUMNS)
 
 
 def _safe_nanmean(series: pd.Series) -> float:
@@ -623,9 +906,36 @@ def main() -> None:
         help="Output per-agent/per-model summary CSV (default: <root>/outputs/agent_model_summary.csv)",
     )
     parser.add_argument(
+        "--out-ingredients-audit-csv",
+        default=None,
+        help=(
+            "Output ingredient semantic audit CSV "
+            "(default: <root>/outputs/ingredients_semantic_audit.csv)"
+        ),
+    )
+    parser.add_argument(
         "--judge-model",
         default=None,
         help=f"Judge model for meal text quality (default: {DEFAULT_JUDGE_MODEL})",
+    )
+    parser.add_argument(
+        "--ingredients-matcher-model",
+        default=None,
+        help=(
+            "Semantic ingredient matcher model. "
+            "Defaults to evals/agent_models.yaml ingredients_matcher.model "
+            f"or {DEFAULT_INGREDIENTS_MATCHER_MODEL}."
+        ),
+    )
+    parser.add_argument(
+        "--ingredients-matcher-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Semantic ingredient matcher batch size. "
+            "Defaults to evals/agent_models.yaml ingredients_matcher.batch_size "
+            f"or {DEFAULT_INGREDIENTS_BATCH_SIZE}."
+        ),
     )
     parser.add_argument(
         "--progress-every",
@@ -639,15 +949,28 @@ def main() -> None:
     in_csv = args.in_csv or os.path.join(root, "outputs", "results.csv")
     out_scored_csv = args.out_scored_csv or os.path.join(root, "outputs", "results_scored.csv")
     out_agent_summary_csv = args.out_agent_summary_csv or os.path.join(root, "outputs", "agent_model_summary.csv")
+    out_ingredients_audit_csv = args.out_ingredients_audit_csv or os.path.join(
+        root, "outputs", "ingredients_semantic_audit.csv"
+    )
     judge_model = args.judge_model or DEFAULT_JUDGE_MODEL
     progress_every = max(1, int(args.progress_every))
+    ingredients_matcher_model, ingredients_matcher_batch_size = _load_ingredients_matcher_config(
+        root=root,
+        cli_model=args.ingredients_matcher_model,
+        cli_batch_size=args.ingredients_matcher_batch_size,
+    )
 
     if not os.path.exists(in_csv):
         raise FileNotFoundError(f"Input CSV not found: {in_csv}")
 
-    print("Building OpenAI client for meal text judge...", flush=True)
+    print("Building OpenAI client for meal text + ingredient semantic judges...", flush=True)
     client = _build_openai_client(root)
-    print(f"Using judge model: {judge_model}", flush=True)
+    print(f"Using text judge model: {judge_model}", flush=True)
+    print(
+        "Using ingredients matcher model: "
+        f"{ingredients_matcher_model} (batch_size={ingredients_matcher_batch_size})",
+        flush=True,
+    )
 
     # Keep raw string cells intact (especially JSON snippets), fill missing as empty string.
     print(f"Loading input CSV: {in_csv}", flush=True)
@@ -667,24 +990,37 @@ def main() -> None:
 
     gt_cache: Dict[str, Dict[str, Any]] = {}
     score_records_list: List[Dict[str, Any]] = []
-    
-    # judge_calls: number of mealAnalysis rows that actually call the LLM judge.
-    # judge_skipped: mealAnalysis rows where judge is intentionally NOT called due 
+
+    print("Scoring semantic ingredient accuracy in batched LLM calls...", flush=True)
+    semantic_ingredients_scores, ingredients_matcher_calls = build_semantic_ingredients_scores(
+        df=df,
+        root=root,
+        gt_cache=gt_cache,
+        client=client,
+        matcher_model=ingredients_matcher_model,
+        batch_size=ingredients_matcher_batch_size,
+        progress_every=progress_every,
+    )
+
+    # text_judge_calls: number of mealAnalysis rows that actually call the LLM text judge.
+    # text_judge_skipped: mealAnalysis rows where judge is intentionally NOT called due
     # to parsing failure or no predicted text to evaluate (see condition below).
     # (parse_ok is false OR predicted title/description/guidance text is empty).
-    judge_calls = 0
-    judge_skipped = 0
+    text_judge_calls = 0
+    text_judge_skipped = 0
     text_fields = ["meal_title", "meal_description", "guidance_message"]
 
-    for idx, (_, row) in enumerate(df.iterrows(), start=1):
+    for idx, (row_idx, row) in enumerate(df.iterrows(), start=1):
         agent = _canonical_agent(_clean_str(row.get("agent", "")))
         if agent == "mealAnalysis":
             parse_ok = _to_bool(row.get("parse_ok"))
             has_pred_text = any(_clean_str(row.get(k)) for k in text_fields)
             if parse_ok is True and has_pred_text:
-                judge_calls += 1
+                text_judge_calls += 1
             else:
-                judge_skipped += 1
+                text_judge_skipped += 1
+
+        ingredients_score = semantic_ingredients_scores.get(row_idx)
 
         score_record = _score_one_row(
             row,
@@ -692,6 +1028,7 @@ def main() -> None:
             gt_cache=gt_cache,
             client=client,
             judge_model=judge_model,
+            ingredients_score=ingredients_score,
         )
         score_records_list.append(score_record)
 
@@ -699,7 +1036,7 @@ def main() -> None:
             pct = int(round((idx / total_rows) * 100)) if total_rows else 100
             print(
                 f"[progress] scored {idx}/{total_rows} rows ({pct}%) | "
-                f"judge_calls={judge_calls} judge_skipped={judge_skipped}",
+                f"text_judge_calls={text_judge_calls} text_judge_skipped={text_judge_skipped}",
                 flush=True,
             )
 
@@ -721,6 +1058,15 @@ def main() -> None:
     os.makedirs(os.path.dirname(out_agent_summary_csv), exist_ok=True)
     agent_summary.to_csv(out_agent_summary_csv, index=False, na_rep="")
 
+    ingredients_audit = build_ingredients_audit_frame(
+        df=df,
+        root=root,
+        gt_cache=gt_cache,
+        semantic_ingredients_scores=semantic_ingredients_scores,
+    )
+    os.makedirs(os.path.dirname(out_ingredients_audit_csv), exist_ok=True)
+    ingredients_audit.to_csv(out_ingredients_audit_csv, index=False, na_rep="")
+
     print(f"Scored rows: {len(df)}")
     print(f"Skipped rows: {skipped_rows}")
     if warning_count:
@@ -741,11 +1087,16 @@ def main() -> None:
         if warning_count > max_preview:
             print(f"... and {warning_count - max_preview} more warning row(s).")
     print(
-        f"Judge calls: {judge_calls} "
-        f"(skipped parse/text-empty meal rows: {judge_skipped})"
+        f"Text judge calls: {text_judge_calls} "
+        f"(skipped parse/text-empty meal rows: {text_judge_skipped})"
+    )
+    print(
+        f"Ingredients matcher calls: {ingredients_matcher_calls} "
+        f"(batch_size={ingredients_matcher_batch_size})"
     )
     print(f"Wrote scored CSV: {out_scored_csv}")
     print(f"Wrote agent/model summary CSV: {out_agent_summary_csv}")
+    print(f"Wrote ingredients audit CSV: {out_ingredients_audit_csv}")
 
 
 if __name__ == "__main__":

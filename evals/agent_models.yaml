@@ -5,17 +5,26 @@ agents:
     io: vision
     models:
       - gpt-4.1-mini
-      - gpt-4.1
+      #- gpt-4.1
 
   - name: mealAnalysis
     io: vision
     models:
-      #- gpt-4.1-mini
+      - gpt-4o
+      - gpt-4.1-mini
       - gpt-4.1
       - gpt-5-mini # can't use this model, requires verification
+      - gpt-5
+      - gpt-5.2-pro
 
   - name: outputGuardrail
     io: text
     models:
       - gpt-4.1-nano
-      - gpt-4.1-mini
+      #- gpt-4.1-mini
+
+# Ingredients matcher configuration used by evals/score_evals.py
+# for semantic ingredient scoring in batched judge calls.
+ingredients_matcher:
+  model: gpt-4.1-mini
+  batch_size: 10
