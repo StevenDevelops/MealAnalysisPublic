@@ -58,14 +58,8 @@ python evals/score_evals.py
 - `results_scored.csv`: Row-level scoring details against ground truth.
 - `agent_model_summary.csv`: Aggregated performance by `(agent, model)`.
 
-**Agent 1: Input Guardrail**
-Runs first and filters requests before analysis.
-
-**Agent 2: Meal Analysis**
+**Agent: Meal Analysis**
 Performs food recognition and ingredient inference.
-
-**Agent 3: Output Guardrail**
-Reviews generated output before final delivery.
 
 ## Future Improvements
 
