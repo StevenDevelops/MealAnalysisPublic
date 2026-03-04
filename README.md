@@ -10,7 +10,15 @@ This project supports a healthcare client by evaluating whether LLM-based vision
 
 Based on the latest evaluation run:
 
-| results will be updated here shortly
+- **Current pick: `gpt-4.1`**
+- **Why:** highest official `mealAnalysis` `eval_score` in this run: **44.96** (`72/72` scored rows).
+- **Concise diagnostic vs `gpt-5.2-pro`:**
+  - Official `gpt-5.2-pro` score is **30.81**, including `6/72` quota-failure rows.
+  - Ignoring those failures, `gpt-5.2-pro` rises to **33.61**, still below `gpt-4.1`.
+  - On parse-ok rows, ignoring text-quality component, `gpt-4.1` still leads (**64.23** vs **48.02**).
+  - `gpt-5.2-pro` trails on key components: recommendation alignment (**53.03%** vs **66.67%**), macros (**50.47** vs **74.05**), and semantic ingredients (**20.49** vs **33.20**).
+
+Conclusion: for this dataset and prompt setup, the gap is not just quota noise; `gpt-4.1` is currently the better `mealAnalysis` choice.
 
 ## Eval Platform
 
