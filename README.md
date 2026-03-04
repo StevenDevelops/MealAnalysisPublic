@@ -1,5 +1,11 @@
 # Meal Analysis README
 
+## At-a-Glance Summary
+
+1. **LLMs used and why:** We evaluated OpenAI GPT models across pipeline roles and currently use `gpt-4.1` for `mealAnalysis` because it delivered the strongest score/quality performance for this dataset.
+2. **Prompting and evaluation approach:** Prompting is structured per agent, then evaluated with a custom harness where `run_evals` generates raw model outputs and `score_evals` grades them against ground truth into row-level and aggregate metrics.
+3. **Tradeoffs and limitations:** Ingredient-level inference remains the hardest task.
+
 ## Project Goal
 
 This project supports a healthcare client by evaluating whether LLM-based vision workflows can (1) correctly identify the food shown in an image and (2) accurately infer likely ingredients from that image.
