@@ -2,7 +2,7 @@
 
 ## At-a-Glance Summary
 
-1. **LLMs used and why:** We evaluated OpenAI GPT models across pipeline roles and currently use `gpt-4.1` for `mealAnalysis` because it delivered the strongest score/quality performance for this dataset.
+1. **LLMs used and why:** I evaluated OpenAI GPT models across pipeline roles and currently use `gpt-4.1` for `mealAnalysis` because it delivered the strongest score/quality performance for this dataset.
 2. **Prompting and evaluation approach:** Prompting is structured per agent, then evaluated with a custom harness where `run_evals` generates raw model outputs and `score_evals` grades them against ground truth into row-level and aggregate metrics.
 3. **Tradeoffs and limitations:** Ingredient-level inference remains the hardest task.
 
