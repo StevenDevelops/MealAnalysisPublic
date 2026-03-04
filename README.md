@@ -4,8 +4,6 @@
 
 This project supports a healthcare client by evaluating whether LLM-based vision workflows can (1) correctly identify the food shown in an image and (2) accurately infer likely ingredients from that image.
 
-- **Evaluation Results** are summarized in `evaluation_results.ipynb` at the project root.
-
 ## Current Model Picks
 
 Based on the latest evaluation run:
