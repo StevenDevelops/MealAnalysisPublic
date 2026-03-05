@@ -1,5 +1,6 @@
 # Ignore data folder
 data/
+myinfo/"agent"
 
 # Leave initially, but remove before submission
 #myinfo/

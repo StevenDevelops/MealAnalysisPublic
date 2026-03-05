@@ -31,6 +31,7 @@ AGENT_TO_IO: Dict[str, str] = {
     "mealAnalysis": "vision",
     "outputGuardrail": "text",
 }
+AGENTS_ALLOWING_EMPTY_MODELS = {"inputGuardrail", "outputGuardrail"}
 
 """CLASS DEFINITIONS"""
 # Each Sample is a single test input -> expected output, both local files
@@ -255,8 +256,17 @@ def load_agent_configs(config_path: str) -> List[AgentConfig]:
                 f"Invalid io at index {idx}: {io_raw!r}. Allowed: 'vision' or 'text'"
             )
 
-        if not isinstance(models_raw, list) or len(models_raw) == 0:
+        # Allow optional skipping of guardrail agents by setting models: []
+        # or omitting models entirely in YAML.
+        if models_raw is None:
+            models_raw = []
+        if not isinstance(models_raw, list):
             raise RuntimeError(f"Invalid models list for agent {name!r} at index {idx}")
+        if len(models_raw) == 0 and name not in AGENTS_ALLOWING_EMPTY_MODELS:
+            raise RuntimeError(
+                f"Invalid models list for agent {name!r} at index {idx}: "
+                "provide at least one model for this agent."
+            )
 
         models: List[str] = []
         for m in models_raw:
