@@ -1,19 +1,16 @@
 """
-    Author: Steven Bonilla
     File summary:
     This script compares predicted outputs against ground truth data. 
-    It computes various scores such as guardrail/safety pass rates, 
-    macro nutrient accuracy, ingredient accuracy, and text quality (using an LLM judge). 
-    The script handles missing or malformed data gracefully, skipping scoring when necessary and logging warnings. 
-    Finally, it outputs a scored CSV, a summary CSV with average scores by agent and model,
-    and an ingredient semantic audit CSV for manual inspection.
+    The models outputs/answers are being scored and evaluated. 
 """
 import argparse
 import json
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -59,6 +56,7 @@ INGREDIENTS_AUDIT_COLUMNS = [
     "ground_truth_ingredients",
     "ingredients_accuracy_0_100",
 ]
+GT_CACHE_LOCK = threading.Lock()
 
 def _clean_str(v: Any) -> str:
     if v is None:
@@ -152,6 +150,68 @@ def _normalize_name(v: Any) -> Optional[str]:
     return s or None
 
 
+def _normalize_meal_title(v: Any) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+    s = v.strip().lower().replace("_", " ").replace("-", " ")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = " ".join(s.split())
+    return s or None
+
+
+def _tokenize_meal_title(v: Any) -> List[str]:
+    s = _normalize_meal_title(v)
+    if not s:
+        return []
+    return s.split()
+
+
+def _simple_stem(token: str) -> str:
+    t = token.strip().lower()
+    if len(t) > 4 and t.endswith("es"):
+        return t[:-2]
+    if len(t) > 3 and t.endswith("s"):
+        return t[:-1]
+    return t
+
+
+def _meal_title_match_relaxed(pred_title: Any, gt_title: Any) -> Optional[bool]:
+    pred_norm = _normalize_meal_title(pred_title)
+    gt_norm = _normalize_meal_title(gt_title)
+    if not gt_norm:
+        return None
+    if not pred_norm:
+        return False
+    if pred_norm == gt_norm:
+        return True
+
+    pred_tokens = _tokenize_meal_title(pred_norm)
+    gt_tokens = _tokenize_meal_title(gt_norm)
+    if not pred_tokens or not gt_tokens:
+        return False
+
+    pred_set = set(pred_tokens)
+    gt_set = set(gt_tokens)
+    # Allow "pizza" vs "cheese pizza" style matches by accepting subset overlap.
+    if pred_set.issubset(gt_set) or gt_set.issubset(pred_set):
+        return True
+
+    pred_stem_set = {_simple_stem(t) for t in pred_set}
+    gt_stem_set = {_simple_stem(t) for t in gt_set}
+    if pred_stem_set.issubset(gt_stem_set) or gt_stem_set.issubset(pred_stem_set):
+        return True
+
+    return False
+
+
+def _meal_inference_score_0_100(row: Dict[str, Any], gt_meal: Dict[str, Any]) -> Optional[float]:
+    gt_title = gt_meal.get("meal_title", "") if isinstance(gt_meal, dict) else ""
+    is_match = _meal_title_match_relaxed(row.get("meal_title"), gt_title)
+    if is_match is None:
+        return None
+    return 100.0 if is_match else 0.0
+
+
 def _parse_ingredients_json(raw: Any) -> List[Dict[str, Any]]:
     if isinstance(raw, list):
         return raw
@@ -174,12 +234,49 @@ def _resolve_path(root: str, path_value: str) -> str:
 
 
 def _load_ground_truth(path: str, cache: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    if path in cache:
-        return cache[path]
+    with GT_CACHE_LOCK:
+        cached = cache.get(path)
+    if cached is not None:
+        return cached
+
     with open(path, "r", encoding="utf-8") as f:
         obj = json.load(f)
-    cache[path] = obj
+
+    with GT_CACHE_LOCK:
+        cache[path] = obj
     return obj
+
+
+def _warm_ground_truth_cache(
+    df: pd.DataFrame,
+    root: str,
+    cache: Dict[str, Dict[str, Any]],
+) -> None:
+    unique_paths: List[str] = []
+    seen: Set[str] = set()
+    for _, row in df.iterrows():
+        json_path_val = _clean_str(row.get("json_path", ""))
+        if not json_path_val:
+            continue
+        abs_path = _resolve_path(root, json_path_val)
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        unique_paths.append(abs_path)
+
+    total = len(unique_paths)
+    if total == 0:
+        return
+
+    print(f"Warming ground-truth cache from {total} JSON file(s)...", flush=True)
+    loaded = 0
+    for p in unique_paths:
+        try:
+            _load_ground_truth(p, cache)
+            loaded += 1
+        except Exception:
+            continue
+    print(f"Ground-truth cache warmup done: {loaded}/{total} loaded.", flush=True)
 
 
 def _require_env(name: str) -> str:
@@ -252,18 +349,27 @@ def _load_ingredients_matcher_config(
     return model, batch_size
 
 
-def _supports_temperature(model: str) -> bool:
-    """GPT-5 family models reject temperature in many configurations."""
-    return not (model or "").strip().lower().startswith("gpt-5")
-
-
 def _create_response(client: OpenAI, model: str, input_payload: Any):
+    model_lc = (model or "").strip().lower()
+
+    # GPT-5+ models on Responses API often do not support `temperature`.
+    # To reduce variability and keep evaluations as deterministic as possible,
+    # we use fixed reasoning effort for GPT-5 family judge/matcher calls instead.
+    extra_params: Dict[str, Any]
+    if model_lc.startswith("gpt-5.2-pro"):
+        extra_params = {"reasoning": {"effort": "medium"}}
+    elif model_lc.startswith("gpt-5.2"):
+        extra_params = {"reasoning": {"effort": "none"}}
+    elif model_lc.startswith("gpt-5"):
+        extra_params = {"reasoning": {"effort": "minimal"}}
+    else:
+        extra_params = {"temperature": 0}
+
     kwargs: Dict[str, Any] = {
         "model": model,
         "input": input_payload,
     }
-    if _supports_temperature(model):
-        kwargs["temperature"] = 0
+    kwargs.update(extra_params)
     return client.responses.create(**kwargs)
 
 
@@ -516,10 +622,10 @@ def build_semantic_ingredients_scores(
     df: pd.DataFrame,
     root: str,
     gt_cache: Dict[str, Dict[str, Any]],
-    client: OpenAI,
     matcher_model: str,
     batch_size: int,
     progress_every: int,
+    matcher_workers: int,
 ) -> Tuple[Dict[int, Optional[float]], int]:
     score_by_row_index: Dict[int, Optional[float]] = {}
     pending_rows: List[Dict[str, Any]] = []
@@ -577,10 +683,59 @@ def build_semantic_ingredients_scores(
         return score_by_row_index, 0
 
     total_pending = len(pending_rows)
-    judge_calls = 0
+    chunks: List[List[Dict[str, Any]]] = []
+    step = max(1, batch_size)
+    for start in range(0, total_pending, step):
+        chunks.append(pending_rows[start : start + step])
 
-    for start in range(0, total_pending, max(1, batch_size)):
-        chunk = pending_rows[start : start + max(1, batch_size)]
+    matcher_workers = max(1, int(matcher_workers))
+    total_chunks = len(chunks)
+
+    if matcher_workers == 1:
+        client = _build_openai_client(root)
+        for idx, chunk in enumerate(chunks, start=1):
+            payload = [
+                {
+                    "sample_key": x["sample_key"],
+                    "sample_id": x["sample_id"],
+                    "expected_count": x["expected_count"],
+                    "expected": x["expected"],
+                    "predicted": x["predicted"],
+                }
+                for x in chunk
+            ]
+            batch_scores = _score_ingredients_semantic_batch(
+                client=client,
+                matcher_model=matcher_model,
+                batch_payload=payload,
+            )
+
+            for item in chunk:
+                score = batch_scores.get(item["sample_key"])
+                if score is None:
+                    score = item["strict_fallback"]
+                score_by_row_index[item["row_idx"]] = score
+
+            done = min(idx * step, total_pending)
+            if done % progress_every == 0 or done == total_pending:
+                pct = int(round((done / total_pending) * 100))
+                print(
+                    f"[ingredient-matcher] scored {done}/{total_pending} meal rows ({pct}%) "
+                    f"in {idx}/{total_chunks} batch call(s)",
+                    flush=True,
+                )
+        return score_by_row_index, total_chunks
+
+    thread_state = threading.local()
+    completed_rows = 0
+    completed_calls = 0
+
+    def _score_chunk(chunk: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+        client = getattr(thread_state, "client", None)
+        if client is None:
+            client = _build_openai_client(root)
+            thread_state.client = client
+
         payload = [
             {
                 "sample_key": x["sample_key"],
@@ -596,24 +751,30 @@ def build_semantic_ingredients_scores(
             matcher_model=matcher_model,
             batch_payload=payload,
         )
-        judge_calls += 1
+        return chunk, batch_scores
 
-        for item in chunk:
-            score = batch_scores.get(item["sample_key"])
-            if score is None:
-                score = item["strict_fallback"]
-            score_by_row_index[item["row_idx"]] = score
+    with ThreadPoolExecutor(max_workers=matcher_workers) as pool:
+        future_to_chunk = {pool.submit(_score_chunk, chunk): chunk for chunk in chunks}
+        for fut in as_completed(future_to_chunk):
+            chunk, batch_scores = fut.result()
+            for item in chunk:
+                score = batch_scores.get(item["sample_key"])
+                if score is None:
+                    score = item["strict_fallback"]
+                score_by_row_index[item["row_idx"]] = score
 
-        done = min(start + len(chunk), total_pending)
-        if done % progress_every == 0 or done == total_pending:
-            pct = int(round((done / total_pending) * 100))
-            print(
-                f"[ingredient-matcher] scored {done}/{total_pending} meal rows ({pct}%) "
-                f"in {judge_calls} batch call(s)",
-                flush=True,
-            )
+            completed_rows += len(chunk)
+            completed_calls += 1
+            done = min(completed_rows, total_pending)
+            if done % progress_every == 0 or done == total_pending:
+                pct = int(round((done / total_pending) * 100))
+                print(
+                    f"[ingredient-matcher] scored {done}/{total_pending} meal rows ({pct}%) "
+                    f"in {completed_calls}/{total_chunks} batch call(s)",
+                    flush=True,
+                )
 
-    return score_by_row_index, judge_calls
+    return score_by_row_index, completed_calls
 
 # Compute overall meal score as a weighted average of:
 # - 50% recommendation exact (100/0)
@@ -767,6 +928,115 @@ def _score_one_row(
     return out
 
 
+def _compute_text_judge_plan(df: pd.DataFrame) -> Tuple[Dict[int, bool], int, int]:
+    needs_judge_by_idx: Dict[int, bool] = {}
+    text_judge_calls = 0
+    text_judge_skipped = 0
+    text_fields = ["meal_title", "meal_description", "guidance_message"]
+
+    for row_idx, row in df.iterrows():
+        agent = _canonical_agent(_clean_str(row.get("agent", "")))
+        needs_judge = False
+        if agent == "mealAnalysis":
+            parse_ok = _to_bool(row.get("parse_ok"))
+            has_pred_text = any(_clean_str(row.get(k)) for k in text_fields)
+            needs_judge = parse_ok is True and has_pred_text
+            if needs_judge:
+                text_judge_calls += 1
+            else:
+                text_judge_skipped += 1
+        needs_judge_by_idx[row_idx] = needs_judge
+
+    return needs_judge_by_idx, text_judge_calls, text_judge_skipped
+
+
+def _score_rows(
+    df: pd.DataFrame,
+    root: str,
+    gt_cache: Dict[str, Dict[str, Any]],
+    judge_model: str,
+    semantic_ingredients_scores: Dict[int, Optional[float]],
+    progress_every: int,
+    score_workers: int,
+) -> Tuple[pd.DataFrame, int, int]:
+    needs_judge_by_idx, text_judge_calls, text_judge_skipped = _compute_text_judge_plan(df)
+
+    total_rows = len(df)
+    score_workers = max(1, int(score_workers))
+    score_by_row_index: Dict[int, Dict[str, Any]] = {}
+
+    if score_workers == 1:
+        client = _build_openai_client(root)
+        completed = 0
+        completed_judge_calls = 0
+        for row_idx, row in df.iterrows():
+            ingredients_score = semantic_ingredients_scores.get(row_idx)
+            score_by_row_index[row_idx] = _score_one_row(
+                row,
+                root=root,
+                gt_cache=gt_cache,
+                client=client,
+                judge_model=judge_model,
+                ingredients_score=ingredients_score,
+            )
+            completed += 1
+            if needs_judge_by_idx.get(row_idx, False):
+                completed_judge_calls += 1
+            if completed % progress_every == 0 or completed == total_rows:
+                pct = int(round((completed / total_rows) * 100)) if total_rows else 100
+                print(
+                    f"[progress] scored {completed}/{total_rows} rows ({pct}%) | "
+                    f"text_judge_calls={completed_judge_calls}/{text_judge_calls} "
+                    f"text_judge_skipped={text_judge_skipped}",
+                    flush=True,
+                )
+    else:
+        thread_state = threading.local()
+
+        def _score_task(row_idx: int, row: pd.Series) -> Tuple[int, Dict[str, Any]]:
+            client = getattr(thread_state, "client", None)
+            if client is None:
+                client = _build_openai_client(root)
+                thread_state.client = client
+
+            ingredients_score = semantic_ingredients_scores.get(row_idx)
+            score_record = _score_one_row(
+                row,
+                root=root,
+                gt_cache=gt_cache,
+                client=client,
+                judge_model=judge_model,
+                ingredients_score=ingredients_score,
+            )
+            return row_idx, score_record
+
+        completed = 0
+        completed_judge_calls = 0
+        with ThreadPoolExecutor(max_workers=score_workers) as pool:
+            future_to_idx = {
+                pool.submit(_score_task, row_idx, row): row_idx
+                for row_idx, row in df.iterrows()
+            }
+            for fut in as_completed(future_to_idx):
+                row_idx, score_record = fut.result()
+                score_by_row_index[row_idx] = score_record
+                completed += 1
+                if needs_judge_by_idx.get(row_idx, False):
+                    completed_judge_calls += 1
+                if completed % progress_every == 0 or completed == total_rows:
+                    pct = int(round((completed / total_rows) * 100)) if total_rows else 100
+                    print(
+                        f"[progress] scored {completed}/{total_rows} rows ({pct}%) | "
+                        f"text_judge_calls={completed_judge_calls}/{text_judge_calls} "
+                        f"text_judge_skipped={text_judge_skipped}",
+                        flush=True,
+                    )
+
+    ordered_records = [score_by_row_index[i] for i in df.index]
+    score_records = pd.DataFrame(ordered_records, index=df.index)
+    return score_records, text_judge_calls, text_judge_skipped
+
+
 def build_ingredients_audit_frame(
     df: pd.DataFrame,
     root: str,
@@ -826,7 +1096,11 @@ def _safe_nanmedian(series: pd.Series) -> float:
     return float(np.nanmedian(arr))
 
 
-def _prepare_summary_frame(df: pd.DataFrame) -> pd.DataFrame:
+def _prepare_summary_frame(
+    df: pd.DataFrame,
+    root: str,
+    gt_cache: Dict[str, Dict[str, Any]],
+) -> pd.DataFrame:
     work = df.copy()
     for col in ["input_tokens", "output_tokens", "latency_ms", *SCORE_COLUMNS]:
         if col not in work.columns:
@@ -837,9 +1111,33 @@ def _prepare_summary_frame(df: pd.DataFrame) -> pd.DataFrame:
     work["guardrail_pass_num"] = pd.to_numeric(work["guardrail_pass"], errors="coerce")
     work["safety_pass_num"] = pd.to_numeric(work["safety_pass"], errors="coerce")
     work["meal_composite_num"] = pd.to_numeric(work["meal_composite_0_100"], errors="coerce")
+    work["ingredients_inference_score_num"] = pd.to_numeric(
+        work["ingredients_accuracy_0_100"], errors="coerce"
+    )
     work["input_tokens_num"] = pd.to_numeric(work["input_tokens"], errors="coerce")
     work["output_tokens_num"] = pd.to_numeric(work["output_tokens"], errors="coerce")
     work["latency_ms_num"] = pd.to_numeric(work["latency_ms"], errors="coerce")
+
+    meal_inference_scores: List[float] = []
+    for _, row in work.iterrows():
+        if _canonical_agent(_clean_str(row.get("agent", ""))) != "mealAnalysis":
+            meal_inference_scores.append(np.nan)
+            continue
+
+        json_path_val = _clean_str(row.get("json_path", ""))
+        if not json_path_val:
+            meal_inference_scores.append(np.nan)
+            continue
+
+        try:
+            gt = _load_ground_truth(_resolve_path(root, json_path_val), gt_cache)
+            gt_meal = gt.get("mealAnalysis", {})
+            score = _meal_inference_score_0_100(row.to_dict(), gt_meal if isinstance(gt_meal, dict) else {})
+            meal_inference_scores.append(np.nan if score is None else float(score))
+        except Exception:
+            meal_inference_scores.append(np.nan)
+
+    work["meal_inference_score_num"] = meal_inference_scores
 
     work["eval_score_row"] = np.select(
         [
@@ -863,12 +1161,21 @@ def build_agent_model_summary(prepared_df: pd.DataFrame) -> pd.DataFrame:
         n_rows=("agent", "size"),
         n_scored=("eval_score_row", lambda s: int(s.notna().sum())),
         eval_score=("eval_score_row", _safe_nanmean),
+        meal_inference_score=("meal_inference_score_num", _safe_nanmean),
+        ingredients_inference_score=("ingredients_inference_score_num", _safe_nanmean),
         avg_input_tokens=("input_tokens_num", _safe_nanmean),
         avg_output_tokens=("output_tokens_num", _safe_nanmean),
         p50_latency_ms=("latency_ms_num", _safe_nanmedian),
     )
 
-    for col in ["eval_score", "avg_input_tokens", "avg_output_tokens", "p50_latency_ms"]:
+    for col in [
+        "eval_score",
+        "meal_inference_score",
+        "ingredients_inference_score",
+        "avg_input_tokens",
+        "avg_output_tokens",
+        "p50_latency_ms",
+    ]:
         summary[col] = summary[col].round(2)
 
     summary["n_rows"] = summary["n_rows"].astype(int)
@@ -881,6 +1188,8 @@ def build_agent_model_summary(prepared_df: pd.DataFrame) -> pd.DataFrame:
             "n_rows",
             "n_scored",
             "eval_score",
+            "meal_inference_score",
+            "ingredients_inference_score",
             "avg_input_tokens",
             "avg_output_tokens",
             "p50_latency_ms",
@@ -943,6 +1252,18 @@ def main() -> None:
         default=10,
         help="Print progress every N scored rows (default: 10).",
     )
+    parser.add_argument(
+        "--score-workers",
+        type=int,
+        default=10,
+        help="Parallel workers for row scoring/text judge calls (default: 10).",
+    )
+    parser.add_argument(
+        "--ingredients-matcher-workers",
+        type=int,
+        default=10,
+        help="Parallel workers for semantic ingredient batch calls (default: 10).",
+    )
     args = parser.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -954,6 +1275,8 @@ def main() -> None:
     )
     judge_model = args.judge_model or DEFAULT_JUDGE_MODEL
     progress_every = max(1, int(args.progress_every))
+    score_workers = max(1, int(args.score_workers))
+    ingredients_matcher_workers = max(1, int(args.ingredients_matcher_workers))
     ingredients_matcher_model, ingredients_matcher_batch_size = _load_ingredients_matcher_config(
         root=root,
         cli_model=args.ingredients_matcher_model,
@@ -963,12 +1286,17 @@ def main() -> None:
     if not os.path.exists(in_csv):
         raise FileNotFoundError(f"Input CSV not found: {in_csv}")
 
-    print("Building OpenAI client for meal text + ingredient semantic judges...", flush=True)
-    client = _build_openai_client(root)
+    print("Validating OpenAI client configuration...", flush=True)
+    _ = _build_openai_client(root)
     print(f"Using text judge model: {judge_model}", flush=True)
     print(
         "Using ingredients matcher model: "
         f"{ingredients_matcher_model} (batch_size={ingredients_matcher_batch_size})",
+        flush=True,
+    )
+    print(
+        f"Using score workers: {score_workers} | "
+        f"ingredient matcher workers: {ingredients_matcher_workers}",
         flush=True,
     )
 
@@ -989,58 +1317,28 @@ def main() -> None:
         df["agent"] = df["agent"].astype(str).map(_canonical_agent)
 
     gt_cache: Dict[str, Dict[str, Any]] = {}
-    score_records_list: List[Dict[str, Any]] = []
+    _warm_ground_truth_cache(df, root, gt_cache)
 
     print("Scoring semantic ingredient accuracy in batched LLM calls...", flush=True)
     semantic_ingredients_scores, ingredients_matcher_calls = build_semantic_ingredients_scores(
         df=df,
         root=root,
         gt_cache=gt_cache,
-        client=client,
         matcher_model=ingredients_matcher_model,
         batch_size=ingredients_matcher_batch_size,
         progress_every=progress_every,
+        matcher_workers=ingredients_matcher_workers,
     )
 
-    # text_judge_calls: number of mealAnalysis rows that actually call the LLM text judge.
-    # text_judge_skipped: mealAnalysis rows where judge is intentionally NOT called due
-    # to parsing failure or no predicted text to evaluate (see condition below).
-    # (parse_ok is false OR predicted title/description/guidance text is empty).
-    text_judge_calls = 0
-    text_judge_skipped = 0
-    text_fields = ["meal_title", "meal_description", "guidance_message"]
-
-    for idx, (row_idx, row) in enumerate(df.iterrows(), start=1):
-        agent = _canonical_agent(_clean_str(row.get("agent", "")))
-        if agent == "mealAnalysis":
-            parse_ok = _to_bool(row.get("parse_ok"))
-            has_pred_text = any(_clean_str(row.get(k)) for k in text_fields)
-            if parse_ok is True and has_pred_text:
-                text_judge_calls += 1
-            else:
-                text_judge_skipped += 1
-
-        ingredients_score = semantic_ingredients_scores.get(row_idx)
-
-        score_record = _score_one_row(
-            row,
-            root=root,
-            gt_cache=gt_cache,
-            client=client,
-            judge_model=judge_model,
-            ingredients_score=ingredients_score,
-        )
-        score_records_list.append(score_record)
-
-        if idx % progress_every == 0 or idx == total_rows:
-            pct = int(round((idx / total_rows) * 100)) if total_rows else 100
-            print(
-                f"[progress] scored {idx}/{total_rows} rows ({pct}%) | "
-                f"text_judge_calls={text_judge_calls} text_judge_skipped={text_judge_skipped}",
-                flush=True,
-            )
-
-    score_records = pd.DataFrame(score_records_list, index=df.index)
+    score_records, text_judge_calls, text_judge_skipped = _score_rows(
+        df=df,
+        root=root,
+        gt_cache=gt_cache,
+        judge_model=judge_model,
+        semantic_ingredients_scores=semantic_ingredients_scores,
+        progress_every=progress_every,
+        score_workers=score_workers,
+    )
 
     skipped_rows = int(pd.to_numeric(score_records["_skipped"], errors="coerce").fillna(0).sum())
     for col in SCORE_COLUMNS:
@@ -1053,7 +1351,7 @@ def main() -> None:
     os.makedirs(os.path.dirname(out_scored_csv), exist_ok=True)
     df.to_csv(out_scored_csv, index=False, na_rep="")
 
-    prepared = _prepare_summary_frame(df)
+    prepared = _prepare_summary_frame(df, root=root, gt_cache=gt_cache)
     agent_summary = build_agent_model_summary(prepared)
     os.makedirs(os.path.dirname(out_agent_summary_csv), exist_ok=True)
     agent_summary.to_csv(out_agent_summary_csv, index=False, na_rep="")

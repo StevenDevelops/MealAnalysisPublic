@@ -1,18 +1,17 @@
 """
-    Author: Steven Bonilla
     File summary:
-    This script runs the evaluation harness for the meal analysis project for each
-    (agent, model) tuple on the sample dataset. It loads the dataset from local files,
-    builds a list of evaluation jobs, calls the OpenAI API for each job, parses the outputs, 
-    and writes results to a CSV file.
+    Calls the OpenAI API for each model, parses the outputs, and writes results to a CSV file.
+    Save the models outputs from each model. These are outputs that will be scored and evaluated. 
 """
 import csv
 import time
 import os
 import json
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple, Literal, Any
+from typing import List, Optional, Dict, Tuple, Literal, Any, Mapping
 
 # Imports to make the OpenAI Calls
 import base64
@@ -312,9 +311,19 @@ CSV_COLUMNS = [
 ]
 
 """METHODS FOR RUNNING AGENTS AND OUTPUT RESULTS TO CSV"""
-def _supports_temperature(model: str) -> bool:
-    """GPT-5 family models reject temperature in many configurations."""
-    return not (model or "").strip().lower().startswith("gpt-5")
+def _response_params_for_model(model: str) -> Dict[str, Any]:
+    model_lc = (model or "").strip().lower()
+
+    # GPT-5+ models on Responses API often do not support `temperature`.
+    # To reduce variability and keep evaluations as deterministic as possible,
+    # we use fixed reasoning effort for GPT-5 family models instead.
+    if model_lc.startswith("gpt-5.2-pro"):
+        return {"reasoning": {"effort": "medium"}}
+    if model_lc.startswith("gpt-5.2"):
+        return {"reasoning": {"effort": "none"}}
+    if model_lc.startswith("gpt-5"):
+        return {"reasoning": {"effort": "minimal"}}
+    return {"temperature": 0}
 
 
 def _create_response(client: OpenAI, model: str, input_payload: Any):
@@ -322,15 +331,18 @@ def _create_response(client: OpenAI, model: str, input_payload: Any):
         "model": model,
         "input": input_payload,
     }
-    if _supports_temperature(model):
-        kwargs["temperature"] = 0
+    kwargs.update(_response_params_for_model(model))
     return client.responses.create(**kwargs)
 
 
-def run_agent(job: EvalJob, client: OpenAI) -> Tuple[Dict[str, Any], float, int, int, bool, str]:
+def run_agent(
+    job: EvalJob,
+    client: OpenAI,
+    image_b64_cache: Optional[Mapping[str, str]] = None,
+) -> Tuple[Dict[str, Any], float, int, int, bool, str, str]:
     """
-    Executes one agent call using OpenAI Responses API.
-    Lowest tempearture to encourage more deterministic, predicatable outputs
+    Executes one agent call using OpenAI Responses API with model-aware
+    deterministic request settings.
 
     Returns:
     (agent_output, latency_ms, input_tokens, output_tokens, parse_ok, error_message, raw_output)
@@ -340,8 +352,12 @@ def run_agent(job: EvalJob, client: OpenAI) -> Tuple[Dict[str, Any], float, int,
     try:
         # ---- Build input message based on agent type ----
         if job.io == "vision":
-            # Convert local image -> data URL
-            img_b64 = image_to_base64(job.sample.img_path)
+            # Read image from cache when available to avoid repeated base64 work.
+            img_b64 = ""
+            if image_b64_cache is not None:
+                img_b64 = image_b64_cache.get(job.sample.id, "")
+            if not img_b64:
+                img_b64 = image_to_base64(job.sample.img_path)
             image_part = {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img_b64}"}
 
             if job.agent == "inputGuardrail":
@@ -559,6 +575,23 @@ def image_to_base64(path: str) -> str:
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
+
+def build_image_b64_cache(samples: List[Sample]) -> Dict[str, str]:
+    unique_images: Dict[str, str] = {}
+    for sample in samples:
+        # Keep one encode per sample id.
+        if sample.id not in unique_images:
+            unique_images[sample.id] = sample.img_path
+
+    cache: Dict[str, str] = {}
+    total = len(unique_images)
+    print(f"Pre-encoding {total} image(s) into base64 cache...", flush=True)
+    for idx, (sample_id, img_path) in enumerate(unique_images.items(), start=1):
+        cache[sample_id] = image_to_base64(img_path)
+        if idx % 25 == 0 or idx == total:
+            print(f"[cache] encoded {idx}/{total} image(s)", flush=True)
+    return cache
+
 def build_openai_client(root: str) -> OpenAI:
     # Load .env from project root (if present)
     load_dotenv(dotenv_path=os.path.join(root, ".env"), override=False)
@@ -588,6 +621,12 @@ def main():
         type=int,
         default=12,
         help="Random seed used only when --num-samples is set (default: 12).",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=10,
+        help="Number of parallel OpenAI request workers (default: 10).",
     )
     args = parser.parse_args()
 
@@ -627,6 +666,11 @@ def main():
     for a in agents:
         print(f"- {a.name} ({a.io}): {a.models}")
 
+    has_vision_work = any(a.io == "vision" and len(a.models) > 0 for a in agents)
+    image_b64_cache: Dict[str, str] = {}
+    if has_vision_work:
+        image_b64_cache = build_image_b64_cache(samples)
+
     jobs = build_jobs(samples, agents)
 
     # Dry run: just print a few jobs so we know the harness is correct
@@ -636,25 +680,72 @@ def main():
     out_csv = os.path.join(root, "outputs", "results.csv")
     write_csv_header(out_csv)
 
-    # Build OpenAI client once
-    client = build_openai_client(root)
-    
-    print('============ Staring agent evals... may take a while ============')
+    max_workers = max(1, int(args.max_workers))
+    print(f"Using max_workers={max_workers}")
+    print('============ Starting agent evals... may take a while ============')
     rows: List[Dict[str, Any]] = []
     total_jobs = len(jobs)
-    for idx, job in enumerate(jobs, start=1):
-        agent_output, latency_ms, in_tok, out_tok, parse_ok, err, raw = run_agent(job, client)
-        row = make_csv_row(
-            job, agent_output, root,
-            latency_ms, in_tok, out_tok,
-            parse_ok, err, raw
-        )
-        rows.append(row)
 
-        print(
-            f"[{idx}/{total_jobs}] Ran job: "
-            f"agent={job.agent} model={job.model} id={job.sample.id} parse_ok={parse_ok}"
-        )
+    if total_jobs == 0:
+        print("No eval jobs to run (all configured model lists are empty).")
+    elif max_workers == 1:
+        # Single-thread mode remains useful for debugging.
+        client = build_openai_client(root)
+        for idx, job in enumerate(jobs, start=1):
+            agent_output, latency_ms, in_tok, out_tok, parse_ok, err, raw = run_agent(
+                job, client, image_b64_cache=image_b64_cache
+            )
+            row = make_csv_row(
+                job, agent_output, root,
+                latency_ms, in_tok, out_tok,
+                parse_ok, err, raw
+            )
+            rows.append(row)
+
+            print(
+                f"[{idx}/{total_jobs}] Ran job: "
+                f"agent={job.agent} model={job.model} id={job.sample.id} parse_ok={parse_ok}"
+            )
+    else:
+        # One OpenAI client per worker thread avoids shared-state issues.
+        thread_state = threading.local()
+        ordered_rows: List[Optional[Dict[str, Any]]] = [None] * total_jobs
+
+        def _run_one_job(job: EvalJob) -> Tuple[Dict[str, Any], bool]:
+            client = getattr(thread_state, "client", None)
+            if client is None:
+                client = build_openai_client(root)
+                thread_state.client = client
+
+            agent_output, latency_ms, in_tok, out_tok, parse_ok, err, raw = run_agent(
+                job, client, image_b64_cache=image_b64_cache
+            )
+            row = make_csv_row(
+                job, agent_output, root,
+                latency_ms, in_tok, out_tok,
+                parse_ok, err, raw
+            )
+            return row, parse_ok
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_meta = {
+                pool.submit(_run_one_job, job): (idx, job)
+                for idx, job in enumerate(jobs, start=1)
+            }
+
+            for fut in as_completed(future_to_meta):
+                idx, job = future_to_meta[fut]
+                row, parse_ok = fut.result()
+                ordered_rows[idx - 1] = row
+                completed += 1
+
+                print(
+                    f"[{completed}/{total_jobs}] Ran job: "
+                    f"agent={job.agent} model={job.model} id={job.sample.id} parse_ok={parse_ok}"
+                )
+
+        rows = [r for r in ordered_rows if r is not None]
 
     append_csv_rows(out_csv, rows)
     print(f"Wrote {len(rows)} REAL rows to {out_csv}")
