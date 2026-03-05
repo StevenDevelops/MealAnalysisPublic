@@ -2,30 +2,47 @@
 
 ## At-a-Glance Summary
 
-1. **LLMs used and why:** I evaluated OpenAI GPT models across pipeline roles and currently use `gpt-4.1` for `mealAnalysis` because it delivered the strongest score/quality performance for this dataset.
-2. **Prompting and evaluation approach:** Prompting is structured per agent, then evaluated with a custom harness where `run_evals` generates raw model outputs and `score_evals` grades them against ground truth into row-level and aggregate metrics.
+I implemented a custom Python harness to evaluate different OpenAI GPT models on how well they can label a meal
+and meal ingredients given food images.
+
+1. **LLMs used and why:** I evaluated OpenAI GPT models across pipeline roles and `gpt-4.1` has the strongest score/quality performance for this dataset.
+2. **Prompting and evaluation approach:** Prompting is structured per model, then evaluated with a custom harness where `run_evals` generates raw model outputs and `score_evals` grades them against ground truth into row-level and aggregate metrics.
 3. **Tradeoffs and limitations:** Ingredient-level inference remains the hardest task.
 
 ## Project Goal
 
-This project supports a healthcare client by evaluating whether LLM-based vision workflows can:
-1. correctly identify the food shown in an image (meal inference) and
-2. accurately infer likely ingredients from that image (ingredients inference). 
-> Each model's outputs is scored against a ground truth or "answer key" using semantic matching of ingredients.
+This project supports a healthcare client by evaluating whether LLM-based vision workflows can do:
+1. Meal inference - model can correctly classify or identify the food shown in an image
+2. Ingredients inference - model can accurately infer likely ingredients from that image
+> Each model's outputs is scored against a ground truth or "answer key" using semantic matching of ingredients e.g. "aubergine" and "eggplant" are the same ingredient
 
 ## Current Model Picks
 
+These models were tested:
+
+- `gpt-4o`
+- `gpt-4.1-mini`
+- `gpt-4.1`
+- `gpt-5-mini`
+- `gpt-5`
+- `gpt-5.2-pro`
+
 Based on the latest evaluation run:
 
-- **Current pick: `gpt-4.1`** -- most reliable meal inference and ingredient inference.
-- **Why:** highest official `mealAnalysis` `eval_score` in this run: **44.96** (`72/72` scored rows).
-- **Concise diagnostic vs `gpt-5.2-pro`and other larger LLMs:**
-  - Official `gpt-5.2-pro` score is **30.81**, including `6/72` quota-failure rows.
-  - Ignoring those failures, `gpt-5.2-pro` rises to **33.61**, still below `gpt-4.1`.
-  - On parse-ok rows, ignoring text-quality component, `gpt-4.1` still leads (**64.23** vs **48.02**).
-  - `gpt-5.2-pro` trails on key components: recommendation alignment (**53.03%** vs **66.67%**), macros (**50.47** vs **74.05**), and semantic ingredients (**20.49** vs **33.20**).
+| model | eval_score | meal_inference_score | ingredients_inference_score | p50_latency_ms |
+|---|---:|---:|---:|---:|
+| gpt-4.1 | 70.15 | 50.00 | 51.10 | 3921.73 |
+| gpt-5 | 64.69 | 43.06 | 51.92 | 5874.02 |
+| gpt-4o | 60.40 | 47.22 | 40.13 | 7381.98 |
+| gpt-4.1-mini | 59.25 | 36.11 | 42.42 | 4527.30 |
+| gpt-5.2-pro | 59.05 | 30.56 | 46.89 | 23961.46 |
+| gpt-5-mini | 52.67 | 33.33 | 44.45 | 5330.76 |
 
-Conclusion: for this dataset and prompt setup, the gap is not just quota noise; `gpt-4.1` is currently the better inference choice for identifying the correct ingredients used. 
+- **Current pick: `gpt-4.1`**
+- **Why:** highest overall `eval_score`, strong `meal_inference_score`, near-highest `ingredients_inference_score`, and the lowest `p50_latency_ms` in this comparison set.
+- **How `eval_score` is computed (brief):** weighted meal composite = `50% recommendation exact` + `30% text quality` + `20% average(macros_score, ingredients_accuracy)`.
+
+Conclusion: for this dataset and prompt setup, `gpt-4.1` is the best overall model choice.
 
 ## Eval Platform
 
@@ -55,6 +72,12 @@ conda activate healthevals
 python evals/run_evals.py
 ```
 
+For faster runs, increase parallel workers (default is `10`):
+
+```bash
+python evals/run_evals.py --max-workers 20
+```
+
 For a smaller run, sample a subset:
 
 ```bash
@@ -65,6 +88,12 @@ python evals/run_evals.py --num-samples 10
 
 ```bash
 python evals/score_evals.py
+```
+
+For faster scoring, increase workers for row scoring and ingredient matcher batches:
+
+```bash
+python evals/score_evals.py --score-workers 20 --ingredients-matcher-workers 20
 ```
 
 ### Output Files
@@ -79,5 +108,5 @@ Performs food recognition and ingredient inference.
 ## Future Improvements
 
 - Expand dataset coverage to improve food and ingredient matching confidence.
-- Run evaluation and scoring jobs in parallel to reduce total runtime.
+- Parallelize more of the scoring path to reduce total runtime.
 - Continue tuning prompts and scoring logic for ingredient-level accuracy.

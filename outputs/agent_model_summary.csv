@@ -1,9 +1,8 @@
-agent,model,n_rows,n_scored,eval_score,avg_input_tokens,avg_output_tokens,p50_latency_ms
-inputGuardrail,gpt-4.1-mini,72,72,98.61,474.0,26.92,1442.46
-mealAnalysis,gpt-4.1,72,72,44.96,361.0,196.94,3081.82
-mealAnalysis,gpt-4.1-mini,72,72,33.48,522.0,198.43,4105.24
-mealAnalysis,gpt-4o,72,72,39.12,361.0,178.1,5530.54
-mealAnalysis,gpt-5,72,72,35.7,315.0,1022.03,15342.92
-mealAnalysis,gpt-5-mini,72,72,32.05,413.0,854.69,12230.51
-mealAnalysis,gpt-5.2-pro,72,72,30.81,378.58,352.0,23773.54
-outputGuardrail,gpt-4.1-nano,72,64,6.25,21.96,7.89,17330.19
+agent,model,n_rows,n_scored,eval_score,meal_inference_score,ingredients_inference_score,avg_input_tokens,avg_output_tokens,p50_latency_ms
+mealAnalysis,gpt-4.1,72,72,70.15,50.0,51.1,361.0,200.54,3921.73
+mealAnalysis,gpt-4.1-mini,72,72,59.25,36.11,42.42,522.0,199.69,4527.3
+mealAnalysis,gpt-4o,72,72,60.4,47.22,40.13,361.0,178.62,7381.98
+mealAnalysis,gpt-5,72,72,64.69,43.06,51.92,315.0,245.21,5874.02
+mealAnalysis,gpt-5-mini,72,72,52.67,33.33,44.45,413.0,267.1,5330.76
+mealAnalysis,gpt-5.2,72,72,57.16,26.39,43.92,413.0,237.0,4131.48
+mealAnalysis,gpt-5.2-pro,72,72,59.05,30.56,46.89,413.0,373.19,23961.46
