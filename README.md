@@ -2,8 +2,8 @@
 
 ## At-a-Glance Summary
 
-I implemented a custom Python harness to evaluate different OpenAI GPT models on how well they can label a meal
-and meal ingredients given food images.
+Have you ever wondered which foundational OpenAI model can most accurately identify meal and ingredients with the least latency?
+I implemented a custom Python harness to evaluate just that, evaluating various OpenAI GPT models. Given food images, I score the meal and ingredients inference accuracy.
 
 1. **LLMs used and why:** I evaluated OpenAI GPT models across pipeline roles and `gpt-4.1` has the strongest score/quality performance for this dataset.
 2. **Prompting and evaluation approach:** Prompting is structured per model, then evaluated with a custom harness where `run_evals` generates raw model outputs and `score_evals` grades them against ground truth into row-level and aggregate metrics.
