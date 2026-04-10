@@ -2,7 +2,7 @@
 
 ## At-a-Glance Summary
 
-Have you ever wondered which foundational OpenAI model, given images of food, can most accurately what the food is? How about its ingredients? How about with the least latency? 
+Have you ever wondered which foundational OpenAI model can **identify food in images?** How about its ingredients? Which model might be the fastest at doing this?
 I implemented a custom Python harness to evaluate just that, evaluating various OpenAI GPT models. Given food images, I score the meal and ingredients inference accuracy.
 
 1. **LLMs used and why:** I evaluated OpenAI GPT models across pipeline roles and `gpt-4.1` has the strongest score/quality performance for this dataset.
